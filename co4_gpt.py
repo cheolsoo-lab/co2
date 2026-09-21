@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional
 
 import ccxt
@@ -65,13 +65,6 @@ class BacktestConfig:
     risk_per_trade: float = 0.0075
     max_portfolio_risk: float = 0.02
     max_position_weight: float = 0.40
-    # Post-entry management is part of the OOS-tested execution model.
-    be_trigger_r: float = 0.80
-    be_lock_r: float = 0.05
-    trail_trigger_r: float = 1.20
-    trail_atr: float = 1.50
-    momentum_exit_r: float = 1.00
-    momentum_exit_bars: int = 2
 
 
 # ============================================================
@@ -717,32 +710,37 @@ def backtest_signals(
         exit_price = None
         exit_idx = None
         outcome = "TIME"
-        active_sl = float(sl)
-        initial_r = abs(entry - sl)
-        be_armed = False
-        trail_armed = False
+
         end = min(len(df), entry_idx + cfg.max_holding_bars + 1)
 
         for j in range(entry_idx, end):
-            high = float(df["High"].iloc[j]); low = float(df["Low"].iloc[j])
+            high = float(df["High"].iloc[j])
+            low = float(df["Low"].iloc[j])
+
             if direction == "LONG":
-                hit_tp, hit_sl = high >= tp, low <= active_sl
+                hit_tp = high >= tp
+                hit_sl = low <= sl
             else:
-                hit_tp, hit_sl = low <= tp, high >= active_sl
+                hit_tp = low <= tp
+                hit_sl = high >= sl
+
+            # Conservative rule: if both are touched in one OHLC bar,
+            # assume SL occurred first because intrabar order is unknown.
             if hit_tp and hit_sl:
-                exit_price, exit_idx, outcome = active_sl, j, "SL_AMBIGUOUS"; break
+                exit_price = sl
+                exit_idx = j
+                outcome = "SL_AMBIGUOUS"
+                break
             if hit_sl:
-                exit_price, exit_idx, outcome = active_sl, j, ("BE" if be_armed else ("TRAIL" if trail_armed else "SL")); break
+                exit_price = sl
+                exit_idx = j
+                outcome = "SL"
+                break
             if hit_tp:
-                exit_price, exit_idx, outcome = tp, j, "TP"; break
-            atr_j = float(df["ATR14"].iloc[j]) if np.isfinite(df["ATR14"].iloc[j]) else np.nan
-            favorable_r = ((high-entry)/initial_r) if direction == "LONG" else ((entry-low)/initial_r)
-            if favorable_r >= cfg.be_trigger_r:
-                be_armed = True
-                active_sl = max(active_sl, entry + cfg.be_lock_r*initial_r) if direction == "LONG" else min(active_sl, entry - cfg.be_lock_r*initial_r)
-            if favorable_r >= cfg.trail_trigger_r and np.isfinite(atr_j) and atr_j > 0:
-                trail_armed = True
-                active_sl = max(active_sl, float(df["Close"].iloc[j]) - cfg.trail_atr*atr_j) if direction == "LONG" else min(active_sl, float(df["Close"].iloc[j]) + cfg.trail_atr*atr_j)
+                exit_price = tp
+                exit_idx = j
+                outcome = "TP"
+                break
 
         if exit_price is None:
             exit_idx = end - 1
@@ -911,61 +909,19 @@ def backtest_strategy_logic(df: pd.DataFrame, signals: list[tuple[int, str]],
         exit_price = None
         exit_idx = None
         outcome = "TIME"
-        active_sl = float(sl)
-        initial_r = abs(entry - sl)
-        be_armed = False
-        trail_armed = False
-        momentum_count = 0
         end = min(max_idx, entry_idx + cfg.max_holding_bars + 1)
-
-        # Execution model: management decisions made from information available
-        # at the end of the PREVIOUS bar are applied to the current bar.
-        # This avoids look-ahead when moving SL to BE or trailing it.
         for j in range(entry_idx, end):
             high = float(df["High"].iloc[j]); low = float(df["Low"].iloc[j])
             if direction == "LONG":
-                hit_tp, hit_sl = high >= tp, low <= active_sl
+                hit_tp, hit_sl = high >= tp, low <= sl
             else:
-                hit_tp, hit_sl = low <= tp, high >= active_sl
+                hit_tp, hit_sl = low <= tp, high >= sl
             if hit_tp and hit_sl:
-                exit_price, exit_idx, outcome = active_sl, j, "SL_AMBIGUOUS"; break
+                exit_price, exit_idx, outcome = sl, j, "SL_AMBIGUOUS"; break
             if hit_sl:
-                exit_price, exit_idx, outcome = active_sl, j, ("BE" if be_armed and abs(active_sl-entry) <= initial_r*0.10 else ("TRAIL" if trail_armed else "SL")); break
+                exit_price, exit_idx, outcome = sl, j, "SL"; break
             if hit_tp:
                 exit_price, exit_idx, outcome = tp, j, "TP"; break
-
-            # End-of-bar management for the NEXT bar only.
-            close_j = float(df["Close"].iloc[j])
-            atr_j = float(df["ATR14"].iloc[j]) if np.isfinite(df["ATR14"].iloc[j]) else np.nan
-            if initial_r > 0:
-                favorable_r = ((high - entry) / initial_r) if direction == "LONG" else ((entry - low) / initial_r)
-            else:
-                favorable_r = 0.0
-
-            if favorable_r >= cfg.be_trigger_r:
-                be_armed = True
-                if direction == "LONG":
-                    active_sl = max(active_sl, entry + cfg.be_lock_r * initial_r)
-                else:
-                    active_sl = min(active_sl, entry - cfg.be_lock_r * initial_r)
-
-            if favorable_r >= cfg.trail_trigger_r and np.isfinite(atr_j) and atr_j > 0:
-                trail_armed = True
-                if direction == "LONG":
-                    active_sl = max(active_sl, close_j - cfg.trail_atr * atr_j)
-                else:
-                    active_sl = min(active_sl, close_j + cfg.trail_atr * atr_j)
-
-            # Optional momentum-failure exit only after a meaningful move.
-            if favorable_r >= cfg.momentum_exit_r:
-                if direction == "LONG":
-                    weakening = bool(df["MACD_HIST"].iloc[j] < df["MACD_HIST"].iloc[j-1]) if j > 0 else False
-                else:
-                    weakening = bool(df["MACD_HIST"].iloc[j] > df["MACD_HIST"].iloc[j-1]) if j > 0 else False
-                momentum_count = momentum_count + 1 if weakening else 0
-                if momentum_count >= cfg.momentum_exit_bars:
-                    exit_price, exit_idx, outcome = close_j, j, "MOMENTUM_EXIT"; break
-
         if exit_price is None:
             exit_idx = end - 1
             exit_price = float(df["Close"].iloc[exit_idx])
@@ -1035,220 +991,6 @@ def walk_forward(df: pd.DataFrame, direction: str, cfg: BacktestConfig, strategy
         "max_drawdown": float((equity / peak - 1).min()), "trades": int(len(tr)),
         "avg_trade": float(tr["return"].mean()), "trades_df": tr,
     }
-
-
-def final_oos_management_audit(df: pd.DataFrame, direction: str, strategy: str, cfg: BacktestConfig,
-                               holdout_frac: float = 0.25) -> dict:
-    """Untouched final-holdout audit for post-entry management variants.
-
-    The final holdout is never used to choose parameters.  It is used only to
-    compare pre-defined management profiles and expose whether BE/trailing/
-    momentum exits add robustness or merely improve in-sample appearance.
-    """
-    n = len(df)
-    if n < 360:
-        return {"rows": [], "holdout_start": None, "direction": direction, "strategy": strategy}
-    holdout_start = max(240, int(n * (1.0 - holdout_frac)))
-    context_start = max(0, holdout_start - 240)
-    context = df.iloc[context_start:].copy()
-    local_start = holdout_start - context_start
-    signals = generate_strategy_signals(context, direction, strategy)
-
-    variants = {
-        "BASE": cfg,
-        "BE_ONLY": replace(cfg, trail_trigger_r=99.0, momentum_exit_r=99.0, momentum_exit_bars=999),
-        "BE_TRAIL": replace(cfg, momentum_exit_r=99.0, momentum_exit_bars=999),
-        "FULL": cfg,
-    }
-    rows = []
-    for name, vc in variants.items():
-        bt = backtest_strategy_logic(context, signals, direction, strategy, vc,
-                                      min_idx=local_start, max_idx=len(context))
-        rows.append({
-            "variant": name,
-            "return": bt["total_return"],
-            "win_rate": bt["win_rate"],
-            "profit_factor": bt["profit_factor"],
-            "mdd": bt["max_drawdown"],
-            "trades": bt["trades"],
-            "avg_trade": bt["avg_trade"],
-        })
-    return {
-        "rows": rows,
-        "holdout_start": df.index[holdout_start],
-        "direction": direction,
-        "strategy": strategy,
-        "holdout_bars": n - holdout_start,
-    }
-
-
-def run_final_oos_audit(symbols: list[str], cfg: BacktestConfig, max_symbols: int = 5) -> pd.DataFrame:
-    """Run a small, deliberately fixed final-OOS audit on liquid majors.
-
-    No parameter search is performed here.  The purpose is diagnostic: determine
-    whether the chosen trade-management layer improves unseen-data behavior.
-    """
-    out = []
-    for symbol in symbols[:max_symbols]:
-        try:
-            df, _ = fetch_ohlcv_fallback(symbol, "1d", 700)
-            if len(df) < 360:
-                continue
-            mtf = fetch_mtf_context(symbol)
-            for direction in ("LONG", "SHORT"):
-                for strategy in ("TREND", "REVERSAL"):
-                    audit = final_oos_management_audit(df, direction, strategy, cfg)
-                    for r in audit["rows"]:
-                        out.append({"symbol": symbol, "direction": direction,
-                                    "strategy": strategy, **r,
-                                    "holdout_start": audit["holdout_start"]})
-        except Exception:
-            continue
-    return pd.DataFrame(out)
-
-
-def final_oos_robustness_matrix(df: pd.DataFrame, direction: str, strategy: str, cfg: BacktestConfig, holdout_frac: float = 0.25) -> dict:
-    """Evaluate a small pre-declared neighborhood of management settings on the
-    untouched final holdout. Diagnostic only; never selects live parameters."""
-    n = len(df)
-    if n < 360:
-        return {"rows": [], "holdout_start": None}
-    holdout_start = max(240, int(n * (1.0 - holdout_frac)))
-    context_start = max(0, holdout_start - 240)
-    context = df.iloc[context_start:].copy()
-    local_start = holdout_start - context_start
-    signals = generate_strategy_signals(context, direction, strategy)
-    profiles = {
-        "CONSERVATIVE": replace(cfg, be_trigger_r=1.0, trail_trigger_r=1.5, trail_atr=1.8, momentum_exit_r=1.5, momentum_exit_bars=3),
-        "BASE": cfg,
-        "AGGRESSIVE": replace(cfg, be_trigger_r=0.6, trail_trigger_r=1.0, trail_atr=1.2, momentum_exit_r=0.8, momentum_exit_bars=2),
-    }
-    rows=[]
-    for name, vc in profiles.items():
-        bt=backtest_strategy_logic(context, signals, direction, strategy, vc, min_idx=local_start, max_idx=len(context))
-        rows.append({"profile":name,"return":bt["total_return"],"pf":bt["profit_factor"],"mdd":bt["max_drawdown"],"win_rate":bt["win_rate"],"trades":bt["trades"],"avg_trade":bt["avg_trade"]})
-    return {"rows":rows,"holdout_start":df.index[holdout_start],"holdout_bars":n-holdout_start}
-
-
-def run_final_oos_robustness_audit(symbols: list[str], cfg: BacktestConfig, max_symbols: int = 5) -> pd.DataFrame:
-    """Cross-symbol final-OOS stability audit for a fixed management neighborhood."""
-    out=[]
-    for symbol in symbols[:max_symbols]:
-        try:
-            df,_=fetch_ohlcv_fallback(symbol,"1d",700)
-            if len(df)<360:
-                continue
-            for direction in ("LONG","SHORT"):
-                for strategy in ("TREND","REVERSAL"):
-                    audit=final_oos_robustness_matrix(df,direction,strategy,cfg)
-                    for r in audit["rows"]:
-                        out.append({"symbol":symbol,"direction":direction,"strategy":strategy,**r,"holdout_start":audit["holdout_start"]})
-        except Exception:
-            continue
-    return pd.DataFrame(out)
-
-
-def repeated_oos_audit(df: pd.DataFrame, direction: str, strategy: str, cfg: BacktestConfig,
-                       n_slices: int = 6, test_bars: int = 45, gap_bars: int = 0) -> dict:
-    """Repeated fixed-parameter OOS audit.
-
-    This is deliberately *not* another optimizer.  The management parameters are
-    frozen before every slice.  Each slice gets a fresh historical context and is
-    evaluated only on its later, unseen bars.  The goal is to test whether results
-    survive different market eras instead of relying on one final holdout.
-    """
-    n = len(df)
-    if n < 360 or test_bars < 20:
-        return {"slices": [], "aggregate": empty_metrics(), "stability": 0.0}
-
-    profiles = {
-        "BASE": cfg,
-        "BE_ONLY": replace(cfg, trail_trigger_r=99.0, momentum_exit_r=99.0, momentum_exit_bars=999),
-        "BE_TRAIL": replace(cfg, momentum_exit_r=99.0, momentum_exit_bars=999),
-        "FULL": cfg,
-    }
-    # Fixed, evenly spaced OOS anchors. No slice is selected for being profitable.
-    usable_end = n - 1
-    first_test = max(260, int(n * 0.45))
-    last_test = usable_end - test_bars
-    anchors = np.linspace(first_test, last_test, n_slices).astype(int) if last_test > first_test else []
-    rows = []
-    for anchor in anchors:
-        test_start = int(anchor + gap_bars)
-        test_end = min(test_start + test_bars, n)
-        if test_end - test_start < 20:
-            continue
-        context_start = max(0, test_start - 240)
-        context = df.iloc[context_start:test_end].copy()
-        local_start = test_start - context_start
-        signals = generate_strategy_signals(context, direction, strategy)
-        for profile, pcfg in profiles.items():
-            bt = backtest_strategy_logic(context, signals, direction, strategy, pcfg,
-                                         min_idx=local_start, max_idx=len(context))
-            rows.append({
-                "slice": len({r["slice"] for r in rows}) + 1 if not rows else max(r["slice"] for r in rows) + (0 if r["test_start"] == df.index[test_start] else 1),
-                "profile": profile,
-                "test_start": df.index[test_start], "test_end": df.index[test_end - 1],
-                "return": bt["total_return"], "pf": bt["profit_factor"],
-                "mdd": bt["max_drawdown"], "win_rate": bt["win_rate"],
-                "trades": bt["trades"], "avg_trade": bt["avg_trade"],
-            })
-    if not rows:
-        return {"slices": [], "aggregate": empty_metrics(), "stability": 0.0}
-    rdf = pd.DataFrame(rows)
-    # Aggregate each profile independently across chronological OOS slices.
-    summaries = []
-    for profile, g in rdf.groupby("profile", sort=False):
-        returns = g["return"].astype(float)
-        valid = g["trades"] > 0
-        pos_ratio = float((returns[valid] > 0).mean()) if valid.any() else 0.0
-        median_ret = float(returns[valid].median()) if valid.any() else 0.0
-        pf_vals = pd.to_numeric(g["pf"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-        summaries.append({
-            "profile": profile,
-            "slices": int(len(g)), "traded_slices": int(valid.sum()),
-            "positive_slice_ratio": pos_ratio * 100,
-            "median_slice_return": median_ret,
-            "mean_slice_return": float(returns.mean()),
-            "median_pf": float(pf_vals.median()) if len(pf_vals) else np.nan,
-            "worst_slice_return": float(returns.min()),
-            "best_slice_return": float(returns.max()),
-            "total_trades": int(g["trades"].sum()),
-        })
-    summary = pd.DataFrame(summaries)
-    base = summary[summary["profile"] == "BASE"]
-    if base.empty:
-        stability = 0.0
-    else:
-        b = base.iloc[0]
-        # Stability score is descriptive, not a probability and not a selection score.
-        stability = float(np.clip(
-            0.35 * b["positive_slice_ratio"] +
-            0.25 * np.clip((b["median_slice_return"] + 0.01) * 2500, 0, 100) +
-            0.20 * np.clip((b["median_pf"] if np.isfinite(b["median_pf"]) else 0) * 40, 0, 100) +
-            0.20 * np.clip((b["traded_slices"] / max(1, b["slices"])) * 100, 0, 100), 0, 100))
-    return {"slices": rdf.to_dict("records"), "summary": summary.to_dict("records"),
-            "stability": stability}
-
-
-def run_repeated_oos_audit(symbols: list[str], cfg: BacktestConfig, max_symbols: int = 6) -> pd.DataFrame:
-    """Cross-symbol repeated OOS audit with frozen parameters."""
-    out = []
-    for symbol in symbols[:max_symbols]:
-        try:
-            df, _ = fetch_ohlcv_fallback(symbol, "1d", 700)
-            if len(df) < 360:
-                continue
-            for direction in ("LONG", "SHORT"):
-                for strategy in ("TREND", "REVERSAL"):
-                    audit = repeated_oos_audit(df, direction, strategy, cfg)
-                    for r in audit.get("summary", []):
-                        out.append({"symbol": symbol, "direction": direction,
-                                    "strategy": strategy, **r,
-                                    "stability": audit.get("stability", 0.0)})
-        except Exception:
-            continue
-    return pd.DataFrame(out)
 
 
 # ============================================================
@@ -1468,6 +1210,98 @@ def _pair_corr(a: dict, b: dict) -> float:
     return c if np.isfinite(c) else np.nan
 
 
+def oos_calibrated_win_rate(row: dict) -> tuple[float, float, int]:
+    """Estimate TP-before-SL probability from the OOS sample with shrinkage.
+
+    This is an empirical OOS estimate, not a guaranteed future probability.
+    A Beta(10, 10) prior pulls small samples toward 50%, while larger samples
+    are allowed to move the estimate toward the observed OOS win rate.
+    Returns (estimated_win_rate_pct, sample_confidence_pct, trades).
+    """
+    wf = row.get("wf", {}) or {}
+    trades = int(wf.get("trades", 0) or 0)
+    observed = float(wf.get("win_rate", np.nan))
+    windows = wf.get("windows", []) or []
+    if trades <= 0 or not np.isfinite(observed):
+        return np.nan, 0.0, 0
+
+    # Effective sample size discounts sparse OOS coverage and inconsistent windows.
+    active = [w for w in windows if int(w.get("oos_trades", 0) or 0) > 0]
+    coverage = len(active) / max(len(windows), 1)
+    positive = np.mean([w.get("oos_return", 0.0) > 0 for w in active]) if active else 0.0
+    consistency = 0.5 + 0.5 * float(positive)
+    effective_n = max(1.0, trades * coverage * consistency)
+
+    wins_eff = effective_n * np.clip(observed / 100.0, 0.0, 1.0)
+    # Conservative prior centered at 50% for small samples.
+    prior = 10.0
+    p = (wins_eff + prior) / (effective_n + 2.0 * prior)
+    confidence = 100.0 * (1.0 - math.exp(-effective_n / 12.0))
+    return float(np.clip(p * 100.0, 0.0, 100.0)), float(np.clip(confidence, 0.0, 100.0)), trades
+
+
+def execution_priority_score(row: dict) -> float:
+    """Rank live candidates using market evidence plus OOS reliability.
+
+    The result is an execution-priority index, NOT a probability. OOS evidence
+    is deliberately capped so a small historical sample cannot overpower the
+    current-market signal.
+    """
+    sig = row.get("signal", {}) or {}
+    base = float(row.get("score", 0.0))
+    gap = float(row.get("score_gap", 0.0))
+    mtf = float(sig.get("mtf_score", 0.0))
+    rr = float(sig.get("rr", 0.0))
+    strategy = sig.get("strategy", "TREND")
+    reversal = float(sig.get("reversal_score", 0.0))
+
+    gap_component = float(np.clip(50.0 + gap * 3.0, 0.0, 100.0))
+    mtf_component = float(np.clip(mtf, 0.0, 100.0))
+    rr_component = float(np.clip(50.0 + (rr - 1.0) * 35.0, 0.0, 100.0))
+    rev_component = float(np.clip(reversal, 0.0, 100.0)) if strategy == "REVERSAL" else 70.0
+    oos_prob, oos_conf, _ = oos_calibrated_win_rate(row)
+    oos_component = float(oos_prob) if np.isfinite(oos_prob) else 50.0
+    # Only a fraction of OOS evidence enters ranking; WFO is already inside QUANT.
+    oos_weight = 0.06 if np.isfinite(oos_prob) else 0.0
+    live_weight = 1.0 - oos_weight
+
+    priority = live_weight * (
+        0.55 * base
+        + 0.20 * gap_component
+        + 0.15 * mtf_component
+        + 0.07 * rr_component
+        + 0.03 * rev_component
+    ) + oos_weight * oos_component
+    # Slightly discount low-confidence OOS estimates toward 50 rather than
+    # allowing a noisy sample to create a large rank jump.
+    if np.isfinite(oos_prob):
+        priority = 0.94 * priority + 0.06 * (50.0 + (oos_component - 50.0) * oos_conf / 100.0)
+    return float(np.clip(priority, 0.0, 100.0))
+
+def add_execution_priority(rows: list[dict]) -> None:
+    """Attach an execution-priority index and rank after all score updates."""
+    for r in rows:
+        r["oos_est_win_rate"], r["oos_confidence"], r["oos_sample_trades"] = oos_calibrated_win_rate(r)
+        r["execution_priority"] = execution_priority_score(r)
+        r["execution_rank"] = None
+
+    ordered = sorted(
+        rows,
+        key=lambda r: (
+            r.get("direction") in {"LONG", "SHORT"},
+            float(r.get("execution_priority", 0.0)),
+            float(r.get("score", 0.0)),
+            float(r.get("signal", {}).get("rr", 0.0)),
+        ),
+        reverse=True,
+    )
+    rank = 0
+    for r in ordered:
+        if r.get("direction") in {"LONG", "SHORT"}:
+            rank += 1
+            r["execution_rank"] = rank
+
+
 def select_portfolio_candidates(
     rows: list[dict],
     max_candidates: int = 3,
@@ -1492,10 +1326,13 @@ def select_portfolio_candidates(
     if not candidates:
         return []
 
-    # Use the final QUANT score, then R:R and score gap as tie-breakers.
+    # Use the live execution-priority index first. QUANT remains the primary
+    # underlying signal score, but the list is not presented as a probability
+    # ranking. R:R and directional separation are tie-breakers.
     remaining = sorted(
         candidates,
         key=lambda r: (
+            float(r.get("execution_priority", execution_priority_score(r))),
             float(r.get("score", 0.0)),
             float(r.get("signal", {}).get("rr", 0.0)),
             float(r.get("score_gap", 0.0)),
@@ -1520,7 +1357,7 @@ def select_portfolio_candidates(
             # enter if it is clearly stronger, but it pays a meaningful penalty.
             redundancy_penalty = max(0.0, max_corr - 0.35) * 28.0
             same_dir_penalty = 3.0 if selected and same_dir > 0 else 0.0
-            pscore = float(r.get("score", 0.0)) - redundancy_penalty - same_dir_penalty
+            pscore = float(r.get("execution_priority", execution_priority_score(r))) - redundancy_penalty - same_dir_penalty
 
             # Hard correlation cap unless this is materially stronger than all
             # currently selected alternatives. This prevents BTC/ETH/SOL-like
@@ -1650,6 +1487,8 @@ def attach_validation(rows: list[dict], cfg: BacktestConfig, max_validate: int =
             r["wf"] = empty_metrics()
 
     apply_adaptive_wfo(rows, cfg)
+    # Rank only after WFO has finished updating the final QUANT score.
+    add_execution_priority(rows)
     select_portfolio_candidates(rows, max_candidates=3, max_same_direction=2, corr_limit=0.75)
     apply_position_sizing(rows, cfg)
 
@@ -1714,20 +1553,39 @@ def fmt_price(x):
 def render_regime():
     regime = fetch_market_regime()
 
-    st.subheader("🌐 시장 레짐")
+    label = str(regime.get("label", "Mixed"))
+    score = float(regime.get("score", 50.0))
+    if label == "Risk-On":
+        direction = "상승 우세"
+        long_env, short_env = "유리", "불리"
+        icon = "🟢"
+    elif label == "Risk-Off":
+        direction = "하락 우세"
+        long_env, short_env = "불리", "유리"
+        icon = "🔴"
+    else:
+        label = "Mixed"
+        direction = "방향 혼재"
+        long_env, short_env = "선별 필요", "선별 필요"
+        icon = "🟡"
 
-    c1, c2, c3 = st.columns(3)
+    st.markdown("### 🌐 시장 상태")
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        st.metric("BTC", fmt_price(float(regime["btc"]["Close"])) if regime["btc"] is not None else "-")
+        st.metric("시장 레짐", f"{icon} {label}")
     with c2:
-        st.metric("BTC 레짐", regime["label"])
+        st.metric("시장 방향", direction)
     with c3:
-        st.metric("시장 점수", f"{regime['score']:.0f}/100")
+        st.metric("LONG 환경", long_env)
+    with c4:
+        st.metric("SHORT 환경", short_env)
 
-    if regime["details"]:
-        st.caption(" · ".join(regime["details"]))
-
+    btc = regime.get("btc")
+    btc_txt = fmt_price(float(btc["Close"])) if btc is not None else "-"
+    detail_txt = " · ".join(regime.get("details", []))
+    st.caption(f"BTC {btc_txt} · 시장점수 {score:.0f}/100" + (f" · {detail_txt}" if detail_txt else ""))
     return regime
+
 
 
 def render_mobile_card(row: pd.Series):
@@ -1755,24 +1613,44 @@ def render_mobile_card(row: pd.Series):
 def render_portfolio_candidates(df: pd.DataFrame):
     selected = df[df.get("portfolio_selected", False) == True].copy() if "portfolio_selected" in df else pd.DataFrame()
     if selected.empty:
-        st.info("현재 조건에서 포트폴리오 실행 후보가 없습니다. 개별 신호는 WAIT/후보 상태를 확인하세요.")
+        actionable = df[df["direction"].isin(["LONG", "SHORT"])].copy() if "direction" in df else pd.DataFrame()
+        if actionable.empty:
+            st.warning("⏸️ 현재 즉시 실행 가능한 신호가 없습니다. WAIT 상태를 유지합니다.")
+        else:
+            st.info("현재 조건에서 포트폴리오 확정 후보가 없습니다. 상위 후보는 상세분석에서 확인하세요.")
         return
 
     selected = selected.sort_values("portfolio_rank")
-    st.markdown("### 🧩 최종 실행 포트폴리오")
-    st.caption("상관이 높은 종목의 중복 노출을 줄이고, 최대 3개 신호만 실행 후보로 압축합니다.")
+    st.markdown("### 🚀 지금 실행할 후보")
+    st.caption("순위는 실전 우선순위입니다. QUANT 점수를 확률(승률)로 해석하지 않습니다.")
     for _, row in selected.iterrows():
         sig = row["signal"]
         icon = "🟢" if row["direction"] == "LONG" else "🔴"
-        corr_txt = f" · 선택후보 상관 {row['max_selected_corr']:.2f}" if np.isfinite(row.get("max_selected_corr", np.nan)) else ""
-        st.info(
-            f"{icon} **#{int(row['portfolio_rank'])} {row['symbol']} {row['direction']}** · "
-            f"QUANT {row['score']:.0f} · {sig['strategy']} · {sig['market_state']} · "
-            f"Entry {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} · "
-            f"SL {fmt_price(sig['sl'])} · 🎯 TP {fmt_price(sig['tp'])} · R:R 1:{sig['rr']:.2f}"
-            f"{corr_txt}"
-        )
-        st.caption(str(row.get("portfolio_reason", "")))
+        pos = row.get("position_notional", np.nan)
+        risk = row.get("risk_used", np.nan)
+        pos_txt = f"{pos:,.0f} USDT" if np.isfinite(pos) else "-"
+        risk_txt = f"{risk:,.2f} USDT" if np.isfinite(risk) else "-"
+        prio = float(row.get("execution_priority", row.get("score", 0.0)))
+        with st.container(border=True):
+            st.markdown(f"### {icon} **#{int(row['portfolio_rank'])} {row['symbol']} · {row['direction']}**")
+            a, b, c, d = st.columns(4)
+            a.metric("실전 우선순위", f"{prio:.0f}")
+            b.metric("QUANT", f"{row['score']:.0f}")
+            c.metric("R:R", f"1 : {sig['rr']:.2f}")
+            d.metric("MTF", f"{sig['mtf_score']:.0f}")
+            a, b, c = st.columns(3)
+            a.metric("ENTRY", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
+            b.metric("🔴 SL", fmt_price(sig["sl"]))
+            c.metric("🎯 TP", fmt_price(sig["tp"]))
+            a, b, c = st.columns(3)
+            a.metric("포지션", pos_txt)
+            b.metric("SL 위험", risk_txt)
+            c.metric("전략", sig["strategy"])
+            oos_p = row.get("oos_est_win_rate", np.nan)
+        oos_c = row.get("oos_confidence", 0.0)
+        oos_txt = f" · OOS 추정 승률 {oos_p:.1f}% (신뢰도 {oos_c:.0f})" if np.isfinite(oos_p) else " · OOS 표본 부족"
+        st.caption(f"시장상태 {sig['market_state']} · {row.get('portfolio_reason', '')}{oos_txt}")
+
 
 
 def render_results(df: pd.DataFrame):
@@ -1780,66 +1658,53 @@ def render_results(df: pd.DataFrame):
         st.warning("조건을 만족하는 검증 결과가 없습니다.")
         return
 
-    display = df.copy()
-    display["score"] = display["score"].round(1)
-    display["price"] = display["price"].map(fmt_price)
-    display["30D"] = display["change_30d"].round(2)
-    display["OOS"] = (display["wf"].apply(lambda x: x["total_return"]) * 100).round(2)
-    display["Win"] = display["wf"].apply(lambda x: x["win_rate"]).round(1)
-    display["PF"] = display["wf"].apply(lambda x: x["profit_factor"]).round(2)
-    display["MDD"] = (display["wf"].apply(lambda x: x["max_drawdown"]) * 100).round(2)
-    display["Trades"] = display["wf"].apply(lambda x: x["trades"])
-    display["RR"] = display["signal"].apply(lambda x: x["rr"]).round(2)
-    display["MTF"] = display["signal"].apply(lambda x: x["mtf_score"]).round(0)
-    display["WFO"] = display["wfo_score"].round(0) if "wfo_score" in display else np.nan
-    display["Base"] = display["score_raw"].round(0) if "score_raw" in display else display["score"].round(0)
-    display["WFO비중"] = (display["wfo_weight"] * 100).round(0) if "wfo_weight" in display else 0
-    display["포트폴리오"] = display["portfolio_rank"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "-") if "portfolio_rank" in display else "-"
-    display["선택상관"] = display["max_selected_corr"].round(2) if "max_selected_corr" in display else np.nan
-    display["포지션"] = display["position_notional"].round(0) if "position_notional" in display else np.nan
-    display["비중"] = display["position_weight"].round(1) if "position_weight" in display else np.nan
-    display["SL위험"] = display["risk_used"].round(0) if "risk_used" in display else np.nan
+    with st.expander("🔎 후보 상세 / 전체 분석 결과", expanded=False):
+        display = df.copy()
+        display["우선순위"] = display["execution_priority"].round(1) if "execution_priority" in display else display["score"].round(1)
+        display["score"] = display["score"].round(1)
+        display["price"] = display["price"].map(fmt_price)
+        display["30D"] = display["change_30d"].round(2)
+        display["OOS"] = (display["wf"].apply(lambda x: x["total_return"]) * 100).round(2)
+        display["Win"] = display["wf"].apply(lambda x: x["win_rate"]).round(1)
+        display["OOS추정승률"] = display["oos_est_win_rate"].round(1) if "oos_est_win_rate" in display else np.nan
+        display["OOS신뢰도"] = display["oos_confidence"].round(0) if "oos_confidence" in display else 0
+        display["PF"] = display["wf"].apply(lambda x: x["profit_factor"]).round(2)
+        display["MDD"] = (display["wf"].apply(lambda x: x["max_drawdown"]) * 100).round(2)
+        display["Trades"] = display["wf"].apply(lambda x: x["trades"])
+        display["RR"] = display["signal"].apply(lambda x: x["rr"]).round(2)
+        display["MTF"] = display["signal"].apply(lambda x: x["mtf_score"]).round(0)
+        display["WFO"] = display["wfo_score"].round(0) if "wfo_score" in display else np.nan
+        display["WFO비중"] = (display["wfo_weight"] * 100).round(0) if "wfo_weight" in display else 0
+        display["포트폴리오"] = display["portfolio_rank"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "-") if "portfolio_rank" in display else "-"
+        display["포지션"] = display["position_notional"].round(0) if "position_notional" in display else np.nan
+        display["SL위험"] = display["risk_used"].round(0) if "risk_used" in display else np.nan
+        display["Status"] = display["direction"]
+        display["판정사유"] = display["reason"]
+        cols = ["symbol", "Status", "포트폴리오", "우선순위", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
+        st.dataframe(display[cols], use_container_width=True, hide_index=True, column_config={
+            "symbol":"종목", "Status":"최종판정", "포트폴리오":"실행순위", "우선순위":"실전 우선순위",
+            "score":"QUANT", "price":"현재가", "RR":"R:R", "MTF":"MTF", "OOS추정승률":"OOS 추정 승률%", "OOS신뢰도":"OOS 신뢰도", "WFO":"WFO 견고성",
+            "OOS":"OOS%", "Win":"OOS 승률%", "PF":"PF", "MDD":"MDD%", "Trades":"거래수",
+            "포지션":"권장 포지션(USDT)", "SL위험":"SL 위험금액", "판정사유":"판정사유",
+        })
 
-    display["Status"] = display["direction"]
-    display["판정사유"] = display["reason"]
-    cols = ["symbol", "Status", "포트폴리오", "signal_direction", "score", "Base", "price", "30D", "RR", "MTF", "WFO", "WFO비중", "OOS", "Win", "PF", "MDD", "Trades", "선택상관", "포지션", "비중", "SL위험", "판정사유"]
-    st.dataframe(
-        display[cols],
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "symbol": "종목",
-            "Status": "최종판정",
-            "signal_direction": "분석방향",
-            "score": "최종 QUANT",
-            "Base": "현재시장 점수",
-            "price": "현재가",
-            "30D": "30D%",
-            "OOS": "OOS%",
-            "Win": "승률%",
-            "PF": "PF",
-            "MDD": "MDD%",
-            "Trades": "거래수",
-            "RR": "R:R",
-            "MTF": "MTF",
-            "WFO": "WFO 견고성",
-            "WFO비중": "WFO 반영%",
-            "포트폴리오": "최종 실행순위",
-            "선택상관": "선택후보 상관",
-            "포지션": "권장 포지션(USDT)",
-            "비중": "계좌비중%",
-            "SL위험": "SL 위험금액",
-        },
-    )
+        st.markdown("### 📱 상세 신호")
+        for _, row in df.head(10).iterrows():
+            render_mobile_card(row)
 
-    st.markdown("### 📱 상세 신호")
-    for _, row in df.head(10).iterrows():
-        render_mobile_card(row)
+    with st.expander("📈 점수 분포 / 진단", expanded=False):
+        fig = go.Figure()
+        ranked = df.sort_values("execution_priority", ascending=False) if "execution_priority" in df else df.sort_values("score", ascending=False)
+        fig.add_trace(go.Bar(x=ranked.head(15)["symbol"], y=ranked.head(15)["score"], text=ranked.head(15)["score"].round(0), textposition="auto"))
+        fig.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10), yaxis_title="QUANT SCORE", xaxis_title="")
+        st.plotly_chart(fig, use_container_width=True, key="score_chart_v2")
+        st.caption("QUANT와 실전 우선순위는 예측확률이 아닙니다. OOS 승률은 과거 검증표본의 통계이며 미래 승률을 보장하지 않습니다.")
+
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V2")
-    st.caption("확정봉 · Look-ahead 방지 · 1D/4H/1H MTF · Trend/Reverse · 단일 최적 TP/SL · WFO/OOS 참고")
+    st.title("🔥 Crypto Quant · 실전 매매판")
+    st.caption("확정봉 · 1D/4H/1H MTF · Trend/Reverse · 단일 TP/SL · WFO/OOS는 검증 참고")
 
     with st.sidebar:
         st.header("⚙️ 분석 설정")
@@ -1864,10 +1729,6 @@ def main():
         risk_per_trade = st.number_input("1회 거래 최대위험", 0.001, 0.03, 0.0075, step=0.001, format="%.3f")
         max_portfolio_risk = st.number_input("전체 포트폴리오 최대위험", 0.005, 0.10, 0.02, step=0.005, format="%.3f")
         max_position_weight = st.number_input("단일 포지션 최대 비중", 0.05, 1.0, 0.40, step=0.05, format="%.2f")
-        st.markdown("### 🧪 전략 검증")
-        audit_oos = st.button("🧪 최종 OOS 관리전략 검증", use_container_width=True)
-        audit_robust = st.button("🛡️ 관리파라미터 안정성 검증", use_container_width=True)
-        audit_repeat = st.button("🔁 반복 실전 OOS 검증", use_container_width=True)
 
     regime = render_regime()
 
@@ -1916,72 +1777,11 @@ def main():
         max_position_weight=float(max_position_weight),
     )
 
-    if audit_oos:
-        audit_symbols = [s for s in symbols_top if s.split("/")[0] in TOP_MAJORS][:5]
-        if not audit_symbols:
-            audit_symbols = symbols_top[:5]
-        with st.spinner("최종 OOS 검증 중... (고정 파라미터 · 미사용 후반 구간)"):
-            audit_df = run_final_oos_audit(audit_symbols, cfg, max_symbols=5)
-        st.session_state["final_oos_audit"] = audit_df
-
-    if audit_repeat:
-        audit_symbols = [s for s in symbols_top if s.split("/")[0] in TOP_MAJORS][:6]
-        if not audit_symbols:
-            audit_symbols = symbols_top[:6]
-        with st.spinner("반복 실전 OOS 검증 중... (고정 파라미터 · 여러 시계열 구간)"):
-            repeat_df = run_repeated_oos_audit(audit_symbols, cfg, max_symbols=6)
-        st.session_state["repeated_oos_audit"] = repeat_df
-
-    if audit_robust:
-        audit_symbols = [s for s in symbols_top if s.split("/")[0] in TOP_MAJORS][:5]
-        if not audit_symbols:
-            audit_symbols = symbols_top[:5]
-        with st.spinner("관리파라미터 안정성 검증 중... (고정된 주변값 · 최종 OOS)"):
-            robust_df = run_final_oos_robustness_audit(audit_symbols, cfg, max_symbols=5)
-        st.session_state["final_oos_robustness"] = robust_df
-
-    repeat_df = st.session_state.get("repeated_oos_audit", pd.DataFrame())
-    if not repeat_df.empty:
-        st.markdown("### 🔁 반복 실전 OOS 검증")
-        st.caption("파라미터를 고정한 상태에서 여러 시계열 OOS 구간을 반복 평가합니다. 어느 구간도 성과가 좋다는 이유로 선택하지 않습니다.")
-        rr = (repeat_df.groupby("profile", as_index=False)
-              .agg(양수구간비율=("positive_slice_ratio", "mean"),
-                   중앙구간수익=("median_slice_return", "mean"),
-                   중앙PF=("median_pf", "mean"),
-                   최악구간=("worst_slice_return", "mean"),
-                   거래수=("total_trades", "sum"), 사례수=("symbol", "count"),
-                   안정성=("stability", "mean")))
-        rr["중앙구간수익"] *= 100; rr["최악구간"] *= 100
-        st.dataframe(rr.round({"양수구간비율":1,"중앙구간수익":2,"중앙PF":2,"최악구간":2,"거래수":0,"사례수":0,"안정성":1}), use_container_width=True, hide_index=True)
-        st.caption("안정성 점수는 확률이나 예측치가 아닙니다. 여러 미사용 구간에서 BASE가 얼마나 일관되게 작동했는지를 요약한 진단값입니다.")
-
-    robust_df = st.session_state.get("final_oos_robustness", pd.DataFrame())
-    if not robust_df.empty:
-        st.markdown("### 🛡️ 최종 OOS 관리파라미터 안정성")
-        st.caption("최종 OOS에서 고정된 보수/기본/공격 관리설정의 주변값을 비교합니다. 특정 설정의 최고값을 자동 채택하지 않습니다.")
-        rs=(robust_df.groupby("profile",as_index=False)
-            .agg(Return=("return","mean"), PF=("pf","mean"), MDD=("mdd","mean"), Win=("win_rate","mean"), Trades=("trades","sum"), Cases=("symbol","count")))
-        rs["Return"]*=100; rs["MDD"]*=100
-        st.dataframe(rs.round({"Return":2,"PF":2,"MDD":2,"Win":1,"Trades":0,"Cases":0}),use_container_width=True,hide_index=True)
-        st.caption("안정성 검증의 목적은 파라미터 봉우리가 지나치게 뾰족한지 확인하는 것입니다. 표본이 적으면 결론을 확정하지 않습니다.")
-
-    audit_df = st.session_state.get("final_oos_audit", pd.DataFrame())
-    if not audit_df.empty:
-        st.markdown("### 🧪 최종 OOS 관리전략 검증")
-        st.caption("마지막 25% 구간은 파라미터 선택에 사용하지 않은 최종 검증 구간입니다. 결과는 전략 선택을 자동 변경하지 않습니다.")
-        summary = (audit_df.groupby("variant", as_index=False)
-                   .agg(Return=("return", "mean"), Win=("win_rate", "mean"),
-                        PF=("profit_factor", "mean"), MDD=("mdd", "mean"), Trades=("trades", "sum")))
-        summary["Return"] *= 100; summary["MDD"] *= 100
-        st.dataframe(summary.round({"Return":2,"Win":1,"PF":2,"MDD":2,"Trades":0}),
-                     use_container_width=True, hide_index=True)
-        st.caption("BASE/BE_ONLY/BE_TRAIL/FULL은 사전에 고정된 관리규칙 비교입니다. 표본이 작으면 우열을 단정하지 않습니다.")
-
     st.subheader("🎯 분석 실행")
 
     # Mobile-friendly buttons
-    quick = st.button("⚡ 빠른 분석 — 메이저 + 상위 10", use_container_width=True)
-    full = st.button("🔬 정밀 분석 — 거래대금 상위 30", use_container_width=True)
+    quick = st.button("⚡ 빠른 분석", use_container_width=True)
+    full = st.button("🔬 정밀 분석 · 상위 30", use_container_width=True)
 
     if quick or full:
         symbols = symbols_top[:10] if quick else symbols_top
@@ -1993,32 +1793,16 @@ def main():
     result = st.session_state.get("quant_results", pd.DataFrame())
 
     if not result.empty:
+        qt = st.session_state.get("quant_time")
+        if qt is not None:
+            st.caption(f"마지막 분석: {qt.tz_convert('Asia/Seoul').strftime('%Y-%m-%d %H:%M:%S')} KST · 실전 우선순위/ENTRY/SL/TP 기준으로 정렬")
+
         passed = result[result["direction"].isin(["LONG", "SHORT"])].copy()
         waits = result[result["direction"] == "WAIT"].copy()
-        st.success(f"분석 완료 · {len(result)}개 결과 · 실행신호 {len(passed)}개 · WAIT {len(waits)}개")
+        st.success(f"분석 완료 · {len(passed)}개 실행신호 · {len(waits)}개 WAIT")
         render_portfolio_candidates(result)
         render_results(result)
 
-        st.markdown("### 📈 점수 분포")
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=result.head(15)["symbol"],
-            y=result.head(15)["score"],
-            text=result.head(15)["score"].round(0),
-            textposition="auto",
-        ))
-        fig.update_layout(
-            height=350,
-            margin=dict(l=10, r=10, t=20, b=10),
-            yaxis_title="QUANT SCORE",
-            xaxis_title="",
-        )
-        st.plotly_chart(fig, use_container_width=True, key="score_chart_v2")
-
-        st.caption(
-            "주의: QUANT SCORE는 예측확률이 아니라 추세·모멘텀·구조·거래량·변동성·"
-            "검증성과를 종합한 분석 점수입니다."
-        )
 
     st.divider()
     st.caption("확정봉 · 1D 주 분석 → 상위 후보만 1D/4H/1H MTF 정밀검증 · 구조적 단일 TP/SL · OOS 검증은 참고층 · Data source: CCXT-supported exchanges · Analysis is informational, not financial advice.")
