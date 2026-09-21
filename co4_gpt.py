@@ -1,7 +1,7 @@
 
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V2.5
+Crypto Quant Dashboard V2
 - GitHub / Streamlit Community Cloud deployment oriented
 - Mobile-first UI
 - Confirmed-candle analysis (unfinished candle excluded)
@@ -16,9 +16,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import math
-import json
-import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 import ccxt
@@ -34,7 +32,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V2.5",
+    page_title="🔥 Crypto Quant Dashboard V2",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -56,16 +54,24 @@ class BacktestConfig:
     max_holding_bars: int = 15
     min_oos_trades: int = 5
     atr_window: int = 14
-    train_bars: int = 150
+    train_bars: int = 180
     test_bars: int = 30
     step_bars: int = 30
-    min_train_trades: int = 3
-    data_limit: int = 500
-    min_signal_score: float = 55.0
-    monte_carlo_runs: int = 500
-    use_mtf: bool = True
-    neutral_score_gap: float = 8.0
-    min_direction_score: float = 55.0
+    # WFO/OOS validation is a robustness modifier, never the primary signal engine.
+    wfo_weight_max: float = 0.12
+    wfo_min_trades: int = 5
+    wfo_min_windows: int = 3
+    account_size: float = 10000.0
+    risk_per_trade: float = 0.0075
+    max_portfolio_risk: float = 0.02
+    max_position_weight: float = 0.40
+    # Post-entry management is part of the OOS-tested execution model.
+    be_trigger_r: float = 0.80
+    be_lock_r: float = 0.05
+    trail_trigger_r: float = 1.20
+    trail_atr: float = 1.50
+    momentum_exit_r: float = 1.00
+    momentum_exit_bars: int = 2
 
 
 # ============================================================
@@ -130,80 +136,13 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d",
     return add_indicators(df)
 
 
-def validate_ohlcv(df: pd.DataFrame) -> tuple[bool, list[str]]:
-    if df.empty:
-        return False, ["OHLCV 데이터 없음"]
-    issues = []
-    if not df["timestamp"].is_monotonic_increasing:
-        issues.append("시간순 정렬 오류")
-    if df["timestamp"].duplicated().any():
-        issues.append("중복 캔들")
-    if (df[["Open", "High", "Low", "Close"]] <= 0).any().any():
-        issues.append("0 이하 가격")
-    if (df["High"] < df[["Open", "Close"]].max(axis=1)).any():
-        issues.append("High 불일치")
-    if (df["Low"] > df[["Open", "Close"]].min(axis=1)).any():
-        issues.append("Low 불일치")
-    return len(issues) == 0, issues
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_global_market_data() -> dict:
-    url = "https://api.coingecko.com/api/v3/global"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "CryptoQuantDashboard/2.2"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = json.loads(resp.read().decode("utf-8"))["data"]
-        total = float(data["total_market_cap"].get("usd", np.nan))
-        pct = data.get("market_cap_percentage", {})
-        btc_pct = float(pct.get("btc", np.nan))
-        eth_pct = float(pct.get("eth", np.nan))
-        btc_cap = total * btc_pct / 100 if np.isfinite(btc_pct) else np.nan
-        eth_cap = total * eth_pct / 100 if np.isfinite(eth_pct) else np.nan
-        total3 = total - btc_cap - eth_cap if np.isfinite(btc_cap) and np.isfinite(eth_cap) else np.nan
-        return {"total_market_cap": total, "btc_dominance": btc_pct, "eth_dominance": eth_pct, "total3": total3}
-    except Exception:
-        return {"total_market_cap": np.nan, "btc_dominance": np.nan, "eth_dominance": np.nan, "total3": np.nan}
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_derivatives_snapshot(symbol: str) -> dict:
-    base = symbol.split("/")[0]
-    out = {"funding": np.nan, "oi": np.nan, "oi_value": np.nan}
-    # Derivatives are supplementary factors; failures never block spot analysis.
-    for exchange_id in ["bybit", "binance"]:
-        try:
-            cls = getattr(ccxt, exchange_id)
-            ex = cls({"enableRateLimit": True, "timeout": 10000, "options": {"defaultType": "swap"}})
-            swap_symbol = f"{base}/USDT:USDT"
-            if hasattr(ex, "fetch_funding_rate"):
-                fr = ex.fetch_funding_rate(swap_symbol)
-                if fr and fr.get("fundingRate") is not None:
-                    out["funding"] = float(fr["fundingRate"])
-            if hasattr(ex, "fetch_open_interest"):
-                oi = ex.fetch_open_interest(swap_symbol)
-                if oi:
-                    val = oi.get("openInterestValue") or oi.get("quoteVolume")
-                    amount = oi.get("openInterestAmount")
-                    if val is not None:
-                        out["oi_value"] = float(val)
-                    if amount is not None:
-                        out["oi"] = float(amount)
-            if np.isfinite(out["funding"]) or np.isfinite(out["oi_value"]):
-                return out
-        except Exception:
-            continue
-    return out
-
-
 def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d",
                          limit: int = 700) -> tuple[pd.DataFrame, str]:
     errors = []
     for exchange_id in DEFAULT_EXCHANGES:
         try:
             df = fetch_ohlcv(exchange_id, symbol, timeframe, limit)
-            ok, _ = validate_ohlcv(df)
-            if ok and len(df) >= 100:
+            if len(df) >= 100:
                 return df, exchange_id
         except Exception as e:
             errors.append(f"{exchange_id}: {e}")
@@ -270,6 +209,238 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     return x
 
+
+def fetch_mtf_context(symbol: str) -> dict:
+    """Return confirmed-candle multi-timeframe context for 1D/4H/1H."""
+    result = {}
+    for tf, limit in [("1d", 320), ("4h", 320), ("1h", 320)]:
+        try:
+            df, ex = fetch_ohlcv_fallback(symbol, tf, limit)
+            if len(df) < 220:
+                continue
+            r = df.iloc[-1]
+            result[tf] = {
+                "exchange": ex,
+                "close": float(r["Close"]),
+                "ema20": float(r["EMA20"]),
+                "ema50": float(r["EMA50"]),
+                "ema200": float(r["EMA200"]),
+                "rsi": float(r["RSI14"]),
+                "adx": float(r["ADX14"]),
+                "atr_pct": float(r["ATR_PCT"]),
+                "swing_high": float(r["SWING_HIGH"]) if pd.notna(r["SWING_HIGH"]) else np.nan,
+                "swing_low": float(r["SWING_LOW"]) if pd.notna(r["SWING_LOW"]) else np.nan,
+            }
+        except Exception:
+            continue
+    return result
+
+
+def mtf_direction_score(mtf: dict, direction: str) -> tuple[float, list[str]]:
+    """Score alignment across 1D/4H/1H without using future candles."""
+    if not mtf:
+        return 50.0, ["MTF 데이터 부족"]
+
+    long = direction == "LONG"
+    score = 50.0
+    details = []
+
+    weights = {"1d": 0.50, "4h": 0.30, "1h": 0.20}
+    for tf, w in weights.items():
+        r = mtf.get(tf)
+        if not r:
+            continue
+        local = 50.0
+        if long:
+            if r["close"] > r["ema20"] > r["ema50"]:
+                local += 18
+            elif r["close"] < r["ema20"] < r["ema50"]:
+                local -= 18
+            if r["ema50"] > r["ema200"]:
+                local += 12
+            elif r["ema50"] < r["ema200"]:
+                local -= 12
+            if r["rsi"] >= 50:
+                local += 8
+            else:
+                local -= 8
+        else:
+            if r["close"] < r["ema20"] < r["ema50"]:
+                local += 18
+            elif r["close"] > r["ema20"] > r["ema50"]:
+                local -= 18
+            if r["ema50"] < r["ema200"]:
+                local += 12
+            elif r["ema50"] > r["ema200"]:
+                local -= 12
+            if r["rsi"] <= 50:
+                local += 8
+            else:
+                local -= 8
+
+        score += (local - 50) * w
+        details.append(f"{tf} {'정렬' if local >= 55 else '불일치'}")
+
+    return float(np.clip(score, 0, 100)), details
+
+
+def classify_market_state(df: pd.DataFrame) -> dict:
+    """Classify the current confirmed market state without using future data."""
+    if len(df) < 220:
+        return {"state": "UNKNOWN", "trend": 0.0, "reversal": 0.0, "details": []}
+    r = df.iloc[-1]
+    prev = df.iloc[-4:-1]
+    atr = float(r["ATR14"])
+    close = float(r["Close"])
+    details = []
+    trend = 50.0
+    reversal = 50.0
+
+    up = close > r["EMA20"] > r["EMA50"] and r["EMA50"] > r["EMA200"]
+    down = close < r["EMA20"] < r["EMA50"] and r["EMA50"] < r["EMA200"]
+    adx = float(r["ADX14"])
+    rsi = float(r["RSI14"])
+    atr_pct = float(r["ATR_PCT"])
+
+    if up:
+        trend += 25; details.append("상승 정렬")
+    elif down:
+        trend += 25; details.append("하락 정렬")
+    else:
+        trend -= 5; details.append("추세 혼재")
+
+    if adx >= 25:
+        trend += 15; details.append("추세 강함")
+    elif adx < 18:
+        trend -= 10; details.append("추세 약함")
+
+    # Reversal requires extension + location + loss of momentum/structure.
+    ext_long = rsi >= 72 or (close - float(r["EMA20"])) / max(atr, 1e-12) >= 2.0
+    ext_short = rsi <= 28 or (float(r["EMA20"]) - close) / max(atr, 1e-12) >= 2.0
+    fail_high = close < float(r["SWING_HIGH"]) if pd.notna(r["SWING_HIGH"]) else False
+    fail_low = close > float(r["SWING_LOW"]) if pd.notna(r["SWING_LOW"]) else False
+    macd_falling = len(prev) >= 3 and float(prev["MACD_HIST"].iloc[-1]) < float(prev["MACD_HIST"].iloc[0])
+    macd_rising = len(prev) >= 3 and float(prev["MACD_HIST"].iloc[-1]) > float(prev["MACD_HIST"].iloc[0])
+    vol_confirm = float(r["REL_VOLUME"]) >= 1.15
+
+    rev_long = 50.0
+    rev_short = 50.0
+    if ext_short: rev_long += 18
+    if fail_low: rev_long += 12
+    if macd_rising: rev_long += 8
+    if vol_confirm and ext_short: rev_long += 7
+    if ext_long: rev_short += 18
+    if fail_high: rev_short += 12
+    if macd_falling: rev_short += 8
+    if vol_confirm and ext_long: rev_short += 7
+    reversal = max(rev_long, rev_short)
+
+    if up and ext_long and fail_high and macd_falling:
+        state = "EXHAUSTION_UP"
+    elif down and ext_short and fail_low and macd_rising:
+        state = "EXHAUSTION_DOWN"
+    elif up and adx >= 25:
+        state = "TREND_UP"
+    elif down and adx >= 25:
+        state = "TREND_DOWN"
+    elif adx < 18:
+        state = "RANGE"
+    else:
+        state = "TRANSITION"
+
+    if atr_pct > 8:
+        details.append("고변동성")
+    return {"state": state, "trend": float(np.clip(trend, 0, 100)),
+            "reversal": float(np.clip(reversal, 0, 100)), "details": details,
+            "reversal_long": float(np.clip(rev_long, 0, 100)),
+            "reversal_short": float(np.clip(rev_short, 0, 100))}
+
+
+def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
+                      atr: float, strategy: str, mtf: Optional[dict] = None) -> dict:
+    """Select ONE structural TP using reachability + market geometry.
+
+    The target is not simply the farthest resistance.  Candidates are built from
+    confirmed structure, POC and ATR extensions, then scored by R:R, structural
+    quality and a volatility-based reachability proxy.  All levels come from data
+    available at the signal time.
+    """
+    recent = df.tail(160)
+    levels = []
+
+    if direction == "LONG":
+        if recent["SWING_HIGH"].notna().any():
+            levels.append((float(recent["SWING_HIGH"].dropna().iloc[-1]), 1.15, "swing"))
+        levels.append((float(recent["High"].max()), 1.00, "recent_high"))
+        if pd.notna(recent["POC_Price"].iloc[-1]):
+            poc = float(recent["POC_Price"].iloc[-1])
+            if poc > entry:
+                levels.append((poc, 0.90, "poc"))
+        for tf in ("1h", "4h", "1d"):
+            m = (mtf or {}).get(tf)
+            if m and np.isfinite(m.get("swing_high", np.nan)) and m["swing_high"] > entry:
+                levels.append((float(m["swing_high"]), {"1h": 0.95, "4h": 1.15, "1d": 1.30}[tf], tf + "_swing"))
+        atr_mults = [1.5, 2.0, 2.5, 3.5, 5.0]
+        levels.extend((entry + m * atr, 0.70, f"atr{m}") for m in atr_mults)
+    else:
+        if recent["SWING_LOW"].notna().any():
+            levels.append((float(recent["SWING_LOW"].dropna().iloc[-1]), 1.15, "swing"))
+        levels.append((float(recent["Low"].min()), 1.00, "recent_low"))
+        if pd.notna(recent["POC_Price"].iloc[-1]):
+            poc = float(recent["POC_Price"].iloc[-1])
+            if poc < entry:
+                levels.append((poc, 0.90, "poc"))
+        for tf in ("1h", "4h", "1d"):
+            m = (mtf or {}).get(tf)
+            if m and np.isfinite(m.get("swing_low", np.nan)) and m["swing_low"] < entry:
+                levels.append((float(m["swing_low"]), {"1h": 0.95, "4h": 1.15, "1d": 1.30}[tf], tf + "_swing"))
+        atr_mults = [1.5, 2.0, 2.5, 3.5, 5.0]
+        levels.extend((entry - m * atr, 0.70, f"atr{m}") for m in atr_mults)
+
+    candidates = []
+    seen = set()
+    for price, quality, source in levels:
+        if not np.isfinite(price):
+            continue
+        if direction == "LONG" and price <= entry:
+            continue
+        if direction == "SHORT" and price >= entry:
+            continue
+        key = round(float(price), 8)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((float(price), float(quality), source))
+
+    if not candidates:
+        candidates = [(entry + 2.5 * atr if direction == "LONG" else entry - 2.5 * atr, 0.70, "atr2.5")]
+
+    risk = abs(entry - sl)
+    scored = []
+    for tp, quality, source in candidates:
+        reward = abs(tp - entry)
+        rr = reward / max(risk, 1e-12)
+        if rr < 1.25:
+            continue
+        dist_atr = reward / max(atr, 1e-12)
+        # Reachability is a soft proxy, not a probability.  It favors targets
+        # that are plausible within the current volatility regime.
+        center = 2.2 if strategy == "REVERSAL" else 3.0
+        scale = 1.8 if strategy == "REVERSAL" else 2.4
+        reach = math.exp(-max(dist_atr - center, 0.0) / scale)
+        near_bonus = math.exp(-abs(dist_atr - center) / (scale * 1.8))
+        rr_quality = min(rr / 2.5, 1.6)
+        ev_proxy = (0.45 * rr_quality + 0.30 * reach + 0.15 * near_bonus + 0.10 * quality)
+        scored.append((ev_proxy, tp, rr, dist_atr, source))
+
+    if not scored:
+        # Keep the nearest valid target when every structural level fails the RR floor.
+        tp = min(candidates, key=lambda z: abs(z[0] - entry))[0]
+        return {"tp": float(tp), "rr": float(abs(tp-entry) / max(risk, 1e-12)),
+                "tp_distance_atr": float(abs(tp-entry) / max(atr, 1e-12)), "tp_source": "fallback"}
+
+    _, tp, rr, dist_atr, source = max(scored, key=lambda z: z[0])
+    return {"tp": float(tp), "rr": float(rr), "tp_distance_atr": float(dist_atr), "tp_source": source}
 
 def rolling_poc(df: pd.DataFrame, window: int = 60, bins: int = 20) -> pd.Series:
     values = np.full(len(df), np.nan)
@@ -350,9 +521,13 @@ def basic_regime_score(df: pd.DataFrame) -> dict:
 
 def fetch_market_regime() -> dict:
     result = {
-        "btc": None, "ethbtc": None, "btcd": np.nan, "total3": np.nan,
-        "label": "데이터 부족", "score": 50.0, "details": [],
-        "global": {},
+        "btc": None,
+        "ethbtc": None,
+        "btcd": None,
+        "total3": None,
+        "label": "데이터 부족",
+        "score": 50.0,
+        "details": [],
     }
 
     btc, _ = fetch_ohlcv_fallback("BTC/USDT", "1d", 300)
@@ -361,41 +536,15 @@ def fetch_market_regime() -> dict:
         result["btc"] = btc.iloc[-1]
         result["score"] = r["score"]
         result["label"] = r["label"]
-        result["details"] = list(r["details"])
-        btc_ret_30 = float(btc["Close"].iloc[-1] / btc["Close"].iloc[-31] - 1)
-        result["btc_ret_30"] = btc_ret_30
-    else:
-        result["btc_ret_30"] = np.nan
+        result["details"] = r["details"]
 
+    # ETH/BTC is obtained directly when available.
     try:
         ethbtc, _ = fetch_ohlcv_fallback("ETH/BTC", "1d", 300)
-        if len(ethbtc) >= 31:
+        if len(ethbtc) >= 30:
             result["ethbtc"] = ethbtc.iloc[-1]
-            result["ethbtc_ret_30"] = float(ethbtc["Close"].iloc[-1] / ethbtc["Close"].iloc[-31] - 1)
     except Exception:
-        result["ethbtc_ret_30"] = np.nan
-
-    glob = fetch_global_market_data()
-    result["global"] = glob
-    result["btcd"] = glob.get("btc_dominance", np.nan)
-    result["total3"] = glob.get("total3", np.nan)
-
-    # BTC dominance is interpreted as concentration context, not a standalone direction call.
-    if np.isfinite(result["btcd"]):
-        result["details"].append(f"BTC Dominance {result['btcd']:.1f}%")
-        if result["score"] >= 50 and result["btcd"] < 55:
-            result["score"] = float(np.clip(result["score"] + 4, 0, 100))
-            result["details"].append("BTC 강세 + 상대적 알트 공간")
-        elif result["score"] >= 50 and result["btcd"] > 65:
-            result["score"] = float(np.clip(result["score"] - 4, 0, 100))
-            result["details"].append("BTC 강세 + BTC 집중도 높음")
-
-    if np.isfinite(result.get("ethbtc_ret_30", np.nan)):
-        result["details"].append(f"ETH/BTC 30D {result['ethbtc_ret_30']*100:+.1f}%")
-        if result["ethbtc_ret_30"] > 0.03:
-            result["score"] = float(np.clip(result["score"] + 3, 0, 100))
-        elif result["ethbtc_ret_30"] < -0.03:
-            result["score"] = float(np.clip(result["score"] - 3, 0, 100))
+        pass
 
     return result
 
@@ -412,16 +561,6 @@ def signal_components(row: pd.Series, direction: str) -> dict:
     structure = 0
     volume = 0
     volatility = 0
-    derivatives = 0
-
-    funding = row.get("FUNDING", np.nan)
-    if np.isfinite(funding):
-        # Use genuinely directional funding extremes; ordinary funding near
-        # zero should not receive a directional bonus.
-        if long and funding <= -0.0005:
-            derivatives += 5
-        if not long and funding >= 0.0005:
-            derivatives += 5
 
     if long:
         trend += 10 if row["Close"] > row["EMA20"] else 0
@@ -464,61 +603,75 @@ def signal_components(row: pd.Series, direction: str) -> dict:
         "structure": structure,
         "volume": volume,
         "volatility": volatility,
-        "derivatives": derivatives,
     }
 
 
-def generate_signal(df: pd.DataFrame, direction: str,
-                    tp_atr: float = 2.0, sl_atr: float = 1.0,
-                    market_regime: Optional[dict] = None) -> Optional[dict]:
+def generate_signal(df: pd.DataFrame, direction: str, tp_atr: float = 2.0,
+                    sl_atr: float = 1.0, mtf: Optional[dict] = None,
+                    strategy: Optional[str] = None) -> Optional[dict]:
     if len(df) < 220:
         return None
-
     r = df.iloc[-1]
-    required = [
-        "EMA20", "EMA50", "EMA200", "RSI14", "MACD_HIST", "ROC14",
-        "ADX14", "ATR14", "ATR_PCT", "REL_VOLUME", "VOL_Z",
-        "SWING_HIGH", "SWING_LOW", "POC_Price"
-    ]
+    required = ["EMA20", "EMA50", "EMA200", "RSI14", "MACD_HIST", "ROC14",
+                "ADX14", "ATR14", "ATR_PCT", "REL_VOLUME", "VOL_Z",
+                "SWING_HIGH", "SWING_LOW", "POC_Price"]
     if any(pd.isna(r.get(c)) for c in required):
         return None
-
     components = signal_components(r, direction)
-    raw = sum(components.values()) / 85 * 100  # 20+20+15+15+10+5 = 85
+    trend_score = float(np.clip(sum(components.values()), 0, 100))
+    state = classify_market_state(df)
+    mtf_score, mtf_details = mtf_direction_score(mtf or {}, direction)
+    close = float(r["Close"]); atr = float(r["ATR14"])
 
-    # Market-quality adjustments.
-    if r["ADX14"] < 15:
-        raw -= 10
-    if r["ATR_PCT"] > 8:
-        raw -= 8
+    long = direction == "LONG"
+    if strategy is None:
+        if direction == "LONG" and state["reversal_long"] >= 68 and state["state"] in {"EXHAUSTION_DOWN", "RANGE", "TRANSITION"}:
+            strategy = "REVERSAL"
+        elif direction == "SHORT" and state["reversal_short"] >= 68 and state["state"] in {"EXHAUSTION_UP", "RANGE", "TRANSITION"}:
+            strategy = "REVERSAL"
+        else:
+            strategy = "TREND"
 
-    score = float(np.clip(raw, 0, 100))
-    close = float(r["Close"])
-    atr = float(r["ATR14"])
+    # Reversal score is independent from trend score; do not let trend indicators
+    # veto a genuine exhaustion setup by themselves.
+    if strategy == "REVERSAL":
+        rev = state["reversal_long"] if long else state["reversal_short"]
+        score = rev * 0.50 + (100 - mtf_score) * 0.20 + components["momentum"] / 20 * 15 + components["volume"] / 15 * 15
+        # A reversal needs evidence of exhaustion, not merely an extreme oscillator.
+        if (long and not (state["reversal_long"] >= 65)) or (not long and not (state["reversal_short"] >= 65)):
+            return None
+    else:
+        score = trend_score * 0.65 + mtf_score * 0.25 + components["volume"] / 15 * 10
+        if state["state"] == "RANGE":
+            score -= 8
+    score = float(np.clip(score, 0, 100))
 
     if direction == "LONG":
         entry = close
-        tp = entry + tp_atr * atr
-        sl = entry - sl_atr * atr
+        structural_sl = float(r["SWING_LOW"]) - 0.25 * atr
+        sl = min(entry - sl_atr * atr, structural_sl)
     else:
         entry = close
-        tp = entry - tp_atr * atr
-        sl = entry + sl_atr * atr
+        structural_sl = float(r["SWING_HIGH"]) + 0.25 * atr
+        sl = max(entry + sl_atr * atr, structural_sl)
 
-    rr = abs(tp - entry) / max(abs(entry - sl), 1e-12)
+    tp_info = select_optimal_tp(df, direction, entry, sl, atr, strategy, mtf=mtf)
+    zone = 0.22 * atr if strategy == "TREND" else 0.18 * atr
+    if direction == "LONG":
+        entry_low, entry_high = entry - zone, entry + 0.08 * atr
+    else:
+        entry_low, entry_high = entry - 0.08 * atr, entry + zone
 
     return {
-        "direction": direction,
-        "score": score,
-        "entry_signal_close": entry,
-        "tp": tp,
-        "sl": sl,
-        "rr": rr,
-        "adx": float(r["ADX14"]),
-        "rsi": float(r["RSI14"]),
-        "atr_pct": float(r["ATR_PCT"]),
-        "poc": float(r["POC_Price"]),
-        **components,
+        "direction": direction, "strategy": strategy, "score": score,
+        "entry_signal_close": entry, "entry_low": float(min(entry_low, entry_high)),
+        "entry_high": float(max(entry_low, entry_high)), "tp": tp_info["tp"],
+        "sl": float(sl), "rr": tp_info["rr"], "tp_distance_atr": tp_info["tp_distance_atr"],
+        "mtf_score": mtf_score, "mtf_details": mtf_details, "market_state": state["state"],
+        "state_details": state["details"], "trend_score": trend_score,
+        "reversal_score": state["reversal_long"] if long else state["reversal_short"],
+        "adx": float(r["ADX14"]), "rsi": float(r["RSI14"]), "atr_pct": float(r["ATR_PCT"]),
+        "poc": float(r["POC_Price"]), "volume": float(r["REL_VOLUME"]), **components,
     }
 
 
@@ -539,25 +692,19 @@ def backtest_signals(
     sl_atr: float,
     cfg: BacktestConfig,
 ) -> dict:
-    """Cost-adjusted, non-overlapping trade simulation.
-
-    A signal is generated on a confirmed close and entered at the next open.
-    While a trade is open, later signals are ignored. This prevents accidental
-    overlapping positions from overstating backtest performance.
-    """
     trades = []
-    next_free_idx = -1
 
-    for idx, sig_dir in sorted(signals, key=lambda x: x[0]):
-        if sig_dir != direction or idx < next_free_idx:
+    for idx, sig_dir in signals:
+        if sig_dir != direction:
             continue
         if idx >= len(df) - 2:
             continue
 
+        # Signal is known at confirmed close. Enter next candle open.
         entry_idx = idx + 1
         entry = float(df["Open"].iloc[entry_idx])
         atr = float(df["ATR14"].iloc[idx])
-        if not np.isfinite(atr) or atr <= 0 or not np.isfinite(entry) or entry <= 0:
+        if not np.isfinite(atr) or atr <= 0:
             continue
 
         if direction == "LONG":
@@ -570,46 +717,32 @@ def backtest_signals(
         exit_price = None
         exit_idx = None
         outcome = "TIME"
-        # Exactly max_holding_bars candles are eligible after entry.
-        end = min(len(df), entry_idx + cfg.max_holding_bars)
-        if end <= entry_idx:
-            continue
+        active_sl = float(sl)
+        initial_r = abs(entry - sl)
+        be_armed = False
+        trail_armed = False
+        end = min(len(df), entry_idx + cfg.max_holding_bars + 1)
 
         for j in range(entry_idx, end):
-            open_j = float(df["Open"].iloc[j])
-            high = float(df["High"].iloc[j])
-            low = float(df["Low"].iloc[j])
-
-            # Gap-through handling: if the market opens beyond a stop/target,
-            # execution occurs at the actual open, not at the stale trigger.
+            high = float(df["High"].iloc[j]); low = float(df["Low"].iloc[j])
             if direction == "LONG":
-                if open_j <= sl:
-                    exit_price, exit_idx, outcome = open_j, j, "SL_GAP"
-                    break
-                if open_j >= tp:
-                    exit_price, exit_idx, outcome = open_j, j, "TP_GAP"
-                    break
-                hit_tp, hit_sl = high >= tp, low <= sl
+                hit_tp, hit_sl = high >= tp, low <= active_sl
             else:
-                if open_j >= sl:
-                    exit_price, exit_idx, outcome = open_j, j, "SL_GAP"
-                    break
-                if open_j <= tp:
-                    exit_price, exit_idx, outcome = open_j, j, "TP_GAP"
-                    break
-                hit_tp, hit_sl = low <= tp, high >= sl
-
+                hit_tp, hit_sl = low <= tp, high >= active_sl
             if hit_tp and hit_sl:
-                # Without intrabar tick/path data, assume the adverse level
-                # was reached first. This is deliberately conservative.
-                exit_price, exit_idx, outcome = sl, j, "SL_AMBIGUOUS"
-                break
+                exit_price, exit_idx, outcome = active_sl, j, "SL_AMBIGUOUS"; break
             if hit_sl:
-                exit_price, exit_idx, outcome = sl, j, "SL"
-                break
+                exit_price, exit_idx, outcome = active_sl, j, ("BE" if be_armed else ("TRAIL" if trail_armed else "SL")); break
             if hit_tp:
-                exit_price, exit_idx, outcome = tp, j, "TP"
-                break
+                exit_price, exit_idx, outcome = tp, j, "TP"; break
+            atr_j = float(df["ATR14"].iloc[j]) if np.isfinite(df["ATR14"].iloc[j]) else np.nan
+            favorable_r = ((high-entry)/initial_r) if direction == "LONG" else ((entry-low)/initial_r)
+            if favorable_r >= cfg.be_trigger_r:
+                be_armed = True
+                active_sl = max(active_sl, entry + cfg.be_lock_r*initial_r) if direction == "LONG" else min(active_sl, entry - cfg.be_lock_r*initial_r)
+            if favorable_r >= cfg.trail_trigger_r and np.isfinite(atr_j) and atr_j > 0:
+                trail_armed = True
+                active_sl = max(active_sl, float(df["Close"].iloc[j]) - cfg.trail_atr*atr_j) if direction == "LONG" else min(active_sl, float(df["Close"].iloc[j]) + cfg.trail_atr*atr_j)
 
         if exit_price is None:
             exit_idx = end - 1
@@ -620,18 +753,18 @@ def backtest_signals(
             gross = exit_price / entry - 1
         else:
             gross = entry / exit_price - 1
+
         net = gross - execution_cost(cfg)
 
         trades.append({
             "signal_idx": idx,
             "entry_idx": entry_idx,
             "exit_idx": exit_idx,
-            "signal_time": df["timestamp"].iloc[idx] if "timestamp" in df.columns else pd.NaT,
-            "entry_time": df["timestamp"].iloc[entry_idx] if "timestamp" in df.columns else pd.NaT,
-            "exit_time": df["timestamp"].iloc[exit_idx] if "timestamp" in df.columns else pd.NaT,
-            "entry": entry, "exit": exit_price, "return": net, "outcome": outcome,
+            "entry": entry,
+            "exit": exit_price,
+            "return": net,
+            "outcome": outcome,
         })
-        next_free_idx = exit_idx + 1
 
     if not trades:
         return empty_metrics()
@@ -639,33 +772,34 @@ def backtest_signals(
     tr = pd.DataFrame(trades)
     equity = (1 + tr["return"]).cumprod()
     total_return = float(equity.iloc[-1] - 1)
+
     peak = equity.cummax()
-    max_dd = float((equity / peak - 1).min())
+    dd = equity / peak - 1
+    max_dd = float(dd.min())
 
     wins = tr.loc[tr["return"] > 0, "return"]
     losses = tr.loc[tr["return"] < 0, "return"]
+
     gross_profit = float(wins.sum())
     gross_loss = abs(float(losses.sum()))
     pf = gross_profit / gross_loss if gross_loss > 0 else np.inf
 
+    # Trade-level Sharpe is deliberately NOT annualized with sqrt(365).
+    # It is shown as a standardized trade-return statistic only.
     std = float(tr["return"].std(ddof=1)) if len(tr) > 1 else np.nan
-    sharpe = float(tr["return"].mean() / std) if std > 0 and np.isfinite(std) else np.nan
-    downside = tr.loc[tr["return"] < 0, "return"]
-    downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else np.nan
-    sortino = float(tr["return"].mean() / downside_std) if downside_std > 0 and np.isfinite(downside_std) else np.nan
-    calmar = float(total_return / abs(max_dd)) if max_dd < 0 else np.nan
-    tm = time_based_metrics(tr, df)
-    mc = monte_carlo_bootstrap(tr["return"], cfg.monte_carlo_runs)
+    sharpe = float(tr["return"].mean() / std) if std and np.isfinite(std) else np.nan
 
     return {
-        "total_return": total_return, "win_rate": float((tr["return"] > 0).mean() * 100),
-        "profit_factor": float(pf), "sharpe": sharpe,
-        "time_sharpe": tm["time_sharpe"], "sortino": sortino,
-        "time_sortino": tm["time_sortino"], "calmar": calmar,
-        "recovery_factor": calmar, "max_drawdown": max_dd,
-        "trades": int(len(tr)), "avg_trade": float(tr["return"].mean()),
-        **mc, "trades_df": tr,
+        "total_return": total_return,
+        "win_rate": float((tr["return"] > 0).mean() * 100),
+        "profit_factor": float(pf),
+        "sharpe": sharpe,
+        "max_drawdown": max_dd,
+        "trades": int(len(tr)),
+        "avg_trade": float(tr["return"].mean()),
+        "trades_df": tr,
     }
+
 
 def empty_metrics() -> dict:
     return {
@@ -673,77 +807,10 @@ def empty_metrics() -> dict:
         "win_rate": 0.0,
         "profit_factor": 0.0,
         "sharpe": np.nan,
-        "time_sharpe": np.nan,
-        "sortino": np.nan,
-        "time_sortino": np.nan,
-        "calmar": np.nan,
-        "recovery_factor": np.nan,
         "max_drawdown": 0.0,
         "trades": 0,
         "avg_trade": 0.0,
-        "mc_p05": np.nan, "mc_median": np.nan, "mc_p95": np.nan, "mc_mdd_q05": np.nan,
         "trades_df": pd.DataFrame(),
-    }
-
-
-def time_based_metrics(trades_df: pd.DataFrame, df: pd.DataFrame) -> dict:
-    """Time-based risk metrics on the actual chronological candle grid.
-
-    Realized P&L is booked on exit timestamps. This is still not a full
-    mark-to-market equity curve, but it preserves the true calendar order and
-    avoids treating each trade as an equal time period.
-    """
-    if trades_df.empty or df.empty:
-        return {"time_sharpe": np.nan, "time_sortino": np.nan}
-    if "timestamp" not in df.columns or "exit_time" not in trades_df.columns:
-        return {"time_sharpe": np.nan, "time_sortino": np.nan}
-    idx = pd.DatetimeIndex(df["timestamp"])
-    # Convert realized trade returns into equity-relative returns at the
-    # actual exit candle. This preserves compounding instead of simply adding
-    # independent trade returns.
-    series = pd.Series(0.0, index=idx)
-    equity = 1.0
-    for _, t in trades_df.sort_values("exit_time").iterrows():
-        ts = pd.to_datetime(t["exit_time"], utc=True, errors="coerce")
-        if pd.notna(ts) and ts in series.index:
-            r = float(t["return"])
-            series.loc[ts] += equity * r
-            equity *= (1.0 + r)
-    # Normalize P&L increments by the starting equity. Non-trade candles remain
-    # zero, so the series is a chronological realized-return stream.
-    arr = series.to_numpy(float)
-    if len(arr) < 2 or np.std(arr, ddof=1) <= 0:
-        return {"time_sharpe": np.nan, "time_sortino": np.nan}
-    ann = math.sqrt(365.0)
-    mean = float(np.mean(arr))
-    std = float(np.std(arr, ddof=1))
-    downside = arr[arr < 0]
-    dstd = float(np.std(downside, ddof=1)) if len(downside) > 1 else np.nan
-    return {
-        "time_sharpe": float(mean / std * ann),
-        "time_sortino": float(mean / dstd * ann) if dstd > 0 and np.isfinite(dstd) else np.nan,
-    }
-
-
-def monte_carlo_bootstrap(returns: pd.Series, runs: int = 500, seed: int = 42) -> dict:
-    """Bootstrap trade returns to quantify path uncertainty, not prediction."""
-    arr = pd.to_numeric(returns, errors="coerce").dropna().to_numpy(float)
-    if len(arr) < 5:
-        return {"mc_p05": np.nan, "mc_median": np.nan, "mc_p95": np.nan, "mc_mdd_q05": np.nan}
-    rng = np.random.default_rng(seed)
-    final_returns = np.empty(runs, dtype=float)
-    mdds = np.empty(runs, dtype=float)
-    for k in range(runs):
-        sample = rng.choice(arr, size=len(arr), replace=True)
-        eq = np.cumprod(1.0 + sample)
-        final_returns[k] = eq[-1] - 1.0
-        peak = np.maximum.accumulate(eq)
-        mdds[k] = np.min(eq / peak - 1.0)
-    return {
-        "mc_p05": float(np.quantile(final_returns, 0.05)),
-        "mc_median": float(np.quantile(final_returns, 0.50)),
-        "mc_p95": float(np.quantile(final_returns, 0.95)),
-        "mc_mdd_q05": float(np.quantile(mdds, 0.05)),
     }
 
 
@@ -753,7 +820,7 @@ def monte_carlo_bootstrap(returns: pd.Series, runs: int = 500, seed: int = 42) -
 
 def generate_breakout_signals(df: pd.DataFrame) -> list[tuple[int, str]]:
     signals = []
-    for i in range(0, len(df) - 1):
+    for i in range(30, len(df) - 1):
         r = df.iloc[i]
         if pd.isna(r["SWING_HIGH"]) or pd.isna(r["SWING_LOW"]):
             continue
@@ -779,368 +846,857 @@ def generate_breakout_signals(df: pd.DataFrame) -> list[tuple[int, str]]:
 # 7. WALK-FORWARD
 # ============================================================
 
-def optimize_parameters(train: pd.DataFrame, direction: str,
-                         cfg: BacktestConfig) -> Optional[dict]:
-    signals = generate_breakout_signals(train)
-    if not signals:
-        return None
+def generate_strategy_signals(df: pd.DataFrame, direction: str, strategy: str) -> list[tuple[int, str]]:
+    """Historical signal generator aligned with the live Trend/Reversal logic.
 
-    best = None
-
-    for tp_atr in [1.5, 2.0, 2.5]:
-        for sl_atr in [0.75, 1.0, 1.25]:
-            m = backtest_signals(
-                train, signals, direction, tp_atr, sl_atr, cfg
-            )
-            if m["trades"] < cfg.min_train_trades:
-                continue
-
-            # Penalize unstable/high-drawdown parameter sets.
-            score = (
-                m["total_return"] * 100
-                + min(m["profit_factor"], 5) * 5
-                + (m["sortino"] if np.isfinite(m["sortino"]) else 0) * 5
-                + m["max_drawdown"] * 20
-            )
-
-            candidate = {
-                "score": score,
-                "tp_atr": tp_atr,
-                "sl_atr": sl_atr,
-                "metrics": m,
-            }
-
-            if best is None or candidate["score"] > best["score"]:
-                best = candidate
-
-    return best
+    This deliberately uses only information available at each confirmed bar.
+    MTF is not reconstructed here; the WFO therefore validates the core 1D
+    setup rather than pretending to validate unavailable future information.
+    """
+    signals = []
+    if len(df) < 220:
+        return signals
+    for i in range(220, len(df) - 1):
+        hist = df.iloc[:i + 1]
+        r = hist.iloc[-1]
+        try:
+            comps = signal_components(r, direction)
+            trend_score = float(np.clip(sum(comps.values()), 0, 100))
+            state = classify_market_state(hist)
+            if strategy == "TREND":
+                if direction == "LONG":
+                    ok = r["Close"] > r["EMA20"] > r["EMA50"] and r["EMA50"] > r["EMA200"] and r["MACD_HIST"] > 0 and r["ADX14"] >= 20
+                else:
+                    ok = r["Close"] < r["EMA20"] < r["EMA50"] and r["EMA50"] < r["EMA200"] and r["MACD_HIST"] < 0 and r["ADX14"] >= 20
+                ok = bool(ok and trend_score >= 55 and r["REL_VOLUME"] >= 0.9)
+            else:
+                rev = state["reversal_long"] if direction == "LONG" else state["reversal_short"]
+                ok = bool(rev >= 65)
+            if ok:
+                signals.append((i, direction))
+        except Exception:
+            continue
+    return signals
 
 
-def walk_forward(df: pd.DataFrame, direction: str,
-                 cfg: BacktestConfig) -> dict:
-    if len(df) < cfg.train_bars + cfg.test_bars:
-        return {"windows": [], **empty_metrics()}
-
-    all_trades = []
-    windows = []
-
-    start = 0
-
-    while start + cfg.train_bars + cfg.test_bars <= len(df):
-        train_end = start + cfg.train_bars
-        test_end = train_end + cfg.test_bars
-
-        train = df.iloc[start:train_end].copy()
-        test = df.iloc[train_end:test_end].copy()
-
-        best = optimize_parameters(train, direction, cfg)
-
-        if best is None:
-            start += cfg.step_bars
+def backtest_strategy_logic(df: pd.DataFrame, signals: list[tuple[int, str]],
+                            direction: str, strategy: str, cfg: BacktestConfig,
+                            min_idx: int = 0, max_idx: Optional[int] = None) -> dict:
+    """Backtest the SAME structural Entry/SL/one-TP logic used by the live engine."""
+    trades = []
+    max_idx = len(df) if max_idx is None else min(max_idx, len(df))
+    for idx, sig_dir in signals:
+        if sig_dir != direction or idx < min_idx or idx >= max_idx - 2:
+            continue
+        entry_idx = idx + 1
+        entry = float(df["Open"].iloc[entry_idx])
+        atr = float(df["ATR14"].iloc[idx])
+        if not np.isfinite(atr) or atr <= 0:
+            continue
+        r = df.iloc[idx]
+        if direction == "LONG":
+            structural_sl = float(r["SWING_LOW"]) - 0.25 * atr
+            sl = min(entry - 1.0 * atr, structural_sl)
+        else:
+            structural_sl = float(r["SWING_HIGH"]) + 0.25 * atr
+            sl = max(entry + 1.0 * atr, structural_sl)
+        hist = df.iloc[:idx + 1]
+        tp_info = select_optimal_tp(hist, direction, entry, sl, atr, strategy, mtf=None)
+        tp = float(tp_info["tp"])
+        if direction == "LONG" and not (sl < entry < tp):
+            continue
+        if direction == "SHORT" and not (tp < entry < sl):
             continue
 
-        test_signals = generate_breakout_signals(test)
-        oos = backtest_signals(
-            test,
-            test_signals,
-            direction,
-            best["tp_atr"],
-            best["sl_atr"],
-            cfg,
-        )
+        exit_price = None
+        exit_idx = None
+        outcome = "TIME"
+        active_sl = float(sl)
+        initial_r = abs(entry - sl)
+        be_armed = False
+        trail_armed = False
+        momentum_count = 0
+        end = min(max_idx, entry_idx + cfg.max_holding_bars + 1)
 
-        if not oos["trades_df"].empty:
-            tr = oos["trades_df"].copy()
-            all_trades.append(tr)
+        # Execution model: management decisions made from information available
+        # at the end of the PREVIOUS bar are applied to the current bar.
+        # This avoids look-ahead when moving SL to BE or trailing it.
+        for j in range(entry_idx, end):
+            high = float(df["High"].iloc[j]); low = float(df["Low"].iloc[j])
+            if direction == "LONG":
+                hit_tp, hit_sl = high >= tp, low <= active_sl
+            else:
+                hit_tp, hit_sl = low <= tp, high >= active_sl
+            if hit_tp and hit_sl:
+                exit_price, exit_idx, outcome = active_sl, j, "SL_AMBIGUOUS"; break
+            if hit_sl:
+                exit_price, exit_idx, outcome = active_sl, j, ("BE" if be_armed and abs(active_sl-entry) <= initial_r*0.10 else ("TRAIL" if trail_armed else "SL")); break
+            if hit_tp:
+                exit_price, exit_idx, outcome = tp, j, "TP"; break
 
-        windows.append({
-            "train_start": train.index[0],
-            "train_end": train.index[-1],
-            "test_start": test.index[0],
-            "test_end": test.index[-1],
-            "tp_atr": best["tp_atr"],
-            "sl_atr": best["sl_atr"],
-            "oos_return": oos["total_return"],
-            "oos_win_rate": oos["win_rate"],
-            "oos_trades": oos["trades"],
-            "oos_mdd": oos["max_drawdown"],
-        })
+            # End-of-bar management for the NEXT bar only.
+            close_j = float(df["Close"].iloc[j])
+            atr_j = float(df["ATR14"].iloc[j]) if np.isfinite(df["ATR14"].iloc[j]) else np.nan
+            if initial_r > 0:
+                favorable_r = ((high - entry) / initial_r) if direction == "LONG" else ((entry - low) / initial_r)
+            else:
+                favorable_r = 0.0
 
-        start += cfg.step_bars
+            if favorable_r >= cfg.be_trigger_r:
+                be_armed = True
+                if direction == "LONG":
+                    active_sl = max(active_sl, entry + cfg.be_lock_r * initial_r)
+                else:
+                    active_sl = min(active_sl, entry - cfg.be_lock_r * initial_r)
 
-    if not all_trades:
-        return {"windows": windows, **empty_metrics()}
+            if favorable_r >= cfg.trail_trigger_r and np.isfinite(atr_j) and atr_j > 0:
+                trail_armed = True
+                if direction == "LONG":
+                    active_sl = max(active_sl, close_j - cfg.trail_atr * atr_j)
+                else:
+                    active_sl = min(active_sl, close_j + cfg.trail_atr * atr_j)
 
-    tr = pd.concat(all_trades, ignore_index=True)
+            # Optional momentum-failure exit only after a meaningful move.
+            if favorable_r >= cfg.momentum_exit_r:
+                if direction == "LONG":
+                    weakening = bool(df["MACD_HIST"].iloc[j] < df["MACD_HIST"].iloc[j-1]) if j > 0 else False
+                else:
+                    weakening = bool(df["MACD_HIST"].iloc[j] > df["MACD_HIST"].iloc[j-1]) if j > 0 else False
+                momentum_count = momentum_count + 1 if weakening else 0
+                if momentum_count >= cfg.momentum_exit_bars:
+                    exit_price, exit_idx, outcome = close_j, j, "MOMENTUM_EXIT"; break
+
+        if exit_price is None:
+            exit_idx = end - 1
+            exit_price = float(df["Close"].iloc[exit_idx])
+        gross = (exit_price / entry - 1) if direction == "LONG" else (entry / exit_price - 1)
+        net = gross - execution_cost(cfg)
+        trades.append({"signal_idx": idx, "entry_idx": entry_idx, "exit_idx": exit_idx,
+                       "entry": entry, "exit": exit_price, "return": net, "outcome": outcome})
+
+    if not trades:
+        return empty_metrics()
+    tr = pd.DataFrame(trades)
     equity = (1 + tr["return"]).cumprod()
-    total_return = float(equity.iloc[-1] - 1)
     peak = equity.cummax()
-    max_dd = float((equity / peak - 1).min())
-
     wins = tr.loc[tr["return"] > 0, "return"]
     losses = tr.loc[tr["return"] < 0, "return"]
-    pf = float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else np.inf
     std = float(tr["return"].std(ddof=1)) if len(tr) > 1 else np.nan
-    sharpe = float(tr["return"].mean() / std) if std and np.isfinite(std) else np.nan
-    downside = tr.loc[tr["return"] < 0, "return"]
-    downside_std = float(downside.std(ddof=1)) if len(downside) > 1 else np.nan
-    sortino = float(tr["return"].mean() / downside_std) if downside_std and np.isfinite(downside_std) else np.nan
-    calmar = float(total_return / abs(max_dd)) if max_dd < 0 else np.nan
-    tm = time_based_metrics(tr, df)
-    mc = monte_carlo_bootstrap(tr["return"], cfg.monte_carlo_runs)
-    if windows:
-        counts = pd.Series([(w["tp_atr"], w["sl_atr"]) for w in windows]).value_counts()
-        param_stability = float(counts.iloc[0] / len(windows))
-    else:
-        param_stability = np.nan
-
     return {
-        "windows": windows,
-        "total_return": total_return,
+        "total_return": float(equity.iloc[-1] - 1),
         "win_rate": float((tr["return"] > 0).mean() * 100),
-        "profit_factor": pf,
-        "sharpe": sharpe,
-        "time_sharpe": tm["time_sharpe"],
-        "sortino": sortino,
-        "time_sortino": tm["time_sortino"],
-        "calmar": calmar,
-        "recovery_factor": calmar,
-        "param_stability": param_stability,
-        **mc,
-        "max_drawdown": max_dd,
-        "trades": int(len(tr)),
-        "avg_trade": float(tr["return"].mean()),
-        "trades_df": tr,
+        "profit_factor": float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else np.inf,
+        "sharpe": float(tr["return"].mean() / std) if std and np.isfinite(std) else np.nan,
+        "max_drawdown": float((equity / peak - 1).min()),
+        "trades": int(len(tr)), "avg_trade": float(tr["return"].mean()), "trades_df": tr,
     }
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_mtf_confirmation(symbol: str) -> dict:
-    """4H confirmation used only for the current signal, not historical WFO."""
-    df4, _ = fetch_ohlcv_fallback(symbol, "4h", 260)
-    if len(df4) < 220:
-        return {"score": 50.0, "label": "MTF 부족"}
-    r = df4.iloc[-1]
-    score = 50.0
-    if r["Close"] > r["EMA20"] > r["EMA50"]:
-        score += 25
-    elif r["Close"] < r["EMA20"] < r["EMA50"]:
-        score -= 25
-    if r["ADX14"] >= 20:
-        score += 10 if r["Close"] > r["EMA20"] else -10
-    return {"score": float(np.clip(score, 0, 100)), "label": "상승" if score >= 65 else ("하락" if score <= 35 else "혼조")}
+def walk_forward(df: pd.DataFrame, direction: str, cfg: BacktestConfig, strategy: str = "TREND") -> dict:
+    """Rolling OOS validation of the live structural strategy.
+
+    Unlike the previous version, each OOS signal is generated with its preceding
+    history attached, so 220-bar indicator warm-up does not erase the OOS sample.
+    No WFO score is allowed to change LONG/SHORT/WAIT status.
+    """
+    if len(df) < cfg.train_bars + cfg.test_bars + 220:
+        return {"windows": [], **empty_metrics()}
+    all_trades, windows = [], []
+    start = 0
+    while start + cfg.train_bars + cfg.test_bars <= len(df):
+        train_end = start + cfg.train_bars
+        test_end = train_end + cfg.test_bars
+        context_start = max(0, train_end - 240)
+        context = df.iloc[context_start:test_end].copy()
+        signals = generate_strategy_signals(context, direction, strategy)
+        local_start = train_end - context_start
+        oos = backtest_strategy_logic(context, signals, direction, strategy, cfg,
+                                      min_idx=local_start, max_idx=len(context))
+        if not oos["trades_df"].empty:
+            all_trades.append(oos["trades_df"].copy())
+        windows.append({
+            "train_start": df.index[start], "train_end": df.index[train_end - 1],
+            "test_start": df.index[train_end], "test_end": df.index[test_end - 1],
+            "oos_return": oos["total_return"], "oos_win_rate": oos["win_rate"],
+            "oos_trades": oos["trades"], "oos_mdd": oos["max_drawdown"],
+        })
+        start += cfg.step_bars
+    if not all_trades:
+        return {"windows": windows, **empty_metrics()}
+    tr = pd.concat(all_trades, ignore_index=True)
+    equity = (1 + tr["return"]).cumprod(); peak = equity.cummax()
+    wins = tr.loc[tr["return"] > 0, "return"]; losses = tr.loc[tr["return"] < 0, "return"]
+    std = float(tr["return"].std(ddof=1)) if len(tr) > 1 else np.nan
+    return {
+        "windows": windows, "total_return": float(equity.iloc[-1] - 1),
+        "win_rate": float((tr["return"] > 0).mean() * 100),
+        "profit_factor": float(wins.sum() / abs(losses.sum())) if losses.sum() < 0 else np.inf,
+        "sharpe": float(tr["return"].mean() / std) if std and np.isfinite(std) else np.nan,
+        "max_drawdown": float((equity / peak - 1).min()), "trades": int(len(tr)),
+        "avg_trade": float(tr["return"].mean()), "trades_df": tr,
+    }
+
+
+def final_oos_management_audit(df: pd.DataFrame, direction: str, strategy: str, cfg: BacktestConfig,
+                               holdout_frac: float = 0.25) -> dict:
+    """Untouched final-holdout audit for post-entry management variants.
+
+    The final holdout is never used to choose parameters.  It is used only to
+    compare pre-defined management profiles and expose whether BE/trailing/
+    momentum exits add robustness or merely improve in-sample appearance.
+    """
+    n = len(df)
+    if n < 360:
+        return {"rows": [], "holdout_start": None, "direction": direction, "strategy": strategy}
+    holdout_start = max(240, int(n * (1.0 - holdout_frac)))
+    context_start = max(0, holdout_start - 240)
+    context = df.iloc[context_start:].copy()
+    local_start = holdout_start - context_start
+    signals = generate_strategy_signals(context, direction, strategy)
+
+    variants = {
+        "BASE": cfg,
+        "BE_ONLY": replace(cfg, trail_trigger_r=99.0, momentum_exit_r=99.0, momentum_exit_bars=999),
+        "BE_TRAIL": replace(cfg, momentum_exit_r=99.0, momentum_exit_bars=999),
+        "FULL": cfg,
+    }
+    rows = []
+    for name, vc in variants.items():
+        bt = backtest_strategy_logic(context, signals, direction, strategy, vc,
+                                      min_idx=local_start, max_idx=len(context))
+        rows.append({
+            "variant": name,
+            "return": bt["total_return"],
+            "win_rate": bt["win_rate"],
+            "profit_factor": bt["profit_factor"],
+            "mdd": bt["max_drawdown"],
+            "trades": bt["trades"],
+            "avg_trade": bt["avg_trade"],
+        })
+    return {
+        "rows": rows,
+        "holdout_start": df.index[holdout_start],
+        "direction": direction,
+        "strategy": strategy,
+        "holdout_bars": n - holdout_start,
+    }
+
+
+def run_final_oos_audit(symbols: list[str], cfg: BacktestConfig, max_symbols: int = 5) -> pd.DataFrame:
+    """Run a small, deliberately fixed final-OOS audit on liquid majors.
+
+    No parameter search is performed here.  The purpose is diagnostic: determine
+    whether the chosen trade-management layer improves unseen-data behavior.
+    """
+    out = []
+    for symbol in symbols[:max_symbols]:
+        try:
+            df, _ = fetch_ohlcv_fallback(symbol, "1d", 700)
+            if len(df) < 360:
+                continue
+            mtf = fetch_mtf_context(symbol)
+            for direction in ("LONG", "SHORT"):
+                for strategy in ("TREND", "REVERSAL"):
+                    audit = final_oos_management_audit(df, direction, strategy, cfg)
+                    for r in audit["rows"]:
+                        out.append({"symbol": symbol, "direction": direction,
+                                    "strategy": strategy, **r,
+                                    "holdout_start": audit["holdout_start"]})
+        except Exception:
+            continue
+    return pd.DataFrame(out)
+
+
+def final_oos_robustness_matrix(df: pd.DataFrame, direction: str, strategy: str, cfg: BacktestConfig, holdout_frac: float = 0.25) -> dict:
+    """Evaluate a small pre-declared neighborhood of management settings on the
+    untouched final holdout. Diagnostic only; never selects live parameters."""
+    n = len(df)
+    if n < 360:
+        return {"rows": [], "holdout_start": None}
+    holdout_start = max(240, int(n * (1.0 - holdout_frac)))
+    context_start = max(0, holdout_start - 240)
+    context = df.iloc[context_start:].copy()
+    local_start = holdout_start - context_start
+    signals = generate_strategy_signals(context, direction, strategy)
+    profiles = {
+        "CONSERVATIVE": replace(cfg, be_trigger_r=1.0, trail_trigger_r=1.5, trail_atr=1.8, momentum_exit_r=1.5, momentum_exit_bars=3),
+        "BASE": cfg,
+        "AGGRESSIVE": replace(cfg, be_trigger_r=0.6, trail_trigger_r=1.0, trail_atr=1.2, momentum_exit_r=0.8, momentum_exit_bars=2),
+    }
+    rows=[]
+    for name, vc in profiles.items():
+        bt=backtest_strategy_logic(context, signals, direction, strategy, vc, min_idx=local_start, max_idx=len(context))
+        rows.append({"profile":name,"return":bt["total_return"],"pf":bt["profit_factor"],"mdd":bt["max_drawdown"],"win_rate":bt["win_rate"],"trades":bt["trades"],"avg_trade":bt["avg_trade"]})
+    return {"rows":rows,"holdout_start":df.index[holdout_start],"holdout_bars":n-holdout_start}
+
+
+def run_final_oos_robustness_audit(symbols: list[str], cfg: BacktestConfig, max_symbols: int = 5) -> pd.DataFrame:
+    """Cross-symbol final-OOS stability audit for a fixed management neighborhood."""
+    out=[]
+    for symbol in symbols[:max_symbols]:
+        try:
+            df,_=fetch_ohlcv_fallback(symbol,"1d",700)
+            if len(df)<360:
+                continue
+            for direction in ("LONG","SHORT"):
+                for strategy in ("TREND","REVERSAL"):
+                    audit=final_oos_robustness_matrix(df,direction,strategy,cfg)
+                    for r in audit["rows"]:
+                        out.append({"symbol":symbol,"direction":direction,"strategy":strategy,**r,"holdout_start":audit["holdout_start"]})
+        except Exception:
+            continue
+    return pd.DataFrame(out)
+
+
+def repeated_oos_audit(df: pd.DataFrame, direction: str, strategy: str, cfg: BacktestConfig,
+                       n_slices: int = 6, test_bars: int = 45, gap_bars: int = 0) -> dict:
+    """Repeated fixed-parameter OOS audit.
+
+    This is deliberately *not* another optimizer.  The management parameters are
+    frozen before every slice.  Each slice gets a fresh historical context and is
+    evaluated only on its later, unseen bars.  The goal is to test whether results
+    survive different market eras instead of relying on one final holdout.
+    """
+    n = len(df)
+    if n < 360 or test_bars < 20:
+        return {"slices": [], "aggregate": empty_metrics(), "stability": 0.0}
+
+    profiles = {
+        "BASE": cfg,
+        "BE_ONLY": replace(cfg, trail_trigger_r=99.0, momentum_exit_r=99.0, momentum_exit_bars=999),
+        "BE_TRAIL": replace(cfg, momentum_exit_r=99.0, momentum_exit_bars=999),
+        "FULL": cfg,
+    }
+    # Fixed, evenly spaced OOS anchors. No slice is selected for being profitable.
+    usable_end = n - 1
+    first_test = max(260, int(n * 0.45))
+    last_test = usable_end - test_bars
+    anchors = np.linspace(first_test, last_test, n_slices).astype(int) if last_test > first_test else []
+    rows = []
+    for anchor in anchors:
+        test_start = int(anchor + gap_bars)
+        test_end = min(test_start + test_bars, n)
+        if test_end - test_start < 20:
+            continue
+        context_start = max(0, test_start - 240)
+        context = df.iloc[context_start:test_end].copy()
+        local_start = test_start - context_start
+        signals = generate_strategy_signals(context, direction, strategy)
+        for profile, pcfg in profiles.items():
+            bt = backtest_strategy_logic(context, signals, direction, strategy, pcfg,
+                                         min_idx=local_start, max_idx=len(context))
+            rows.append({
+                "slice": len({r["slice"] for r in rows}) + 1 if not rows else max(r["slice"] for r in rows) + (0 if r["test_start"] == df.index[test_start] else 1),
+                "profile": profile,
+                "test_start": df.index[test_start], "test_end": df.index[test_end - 1],
+                "return": bt["total_return"], "pf": bt["profit_factor"],
+                "mdd": bt["max_drawdown"], "win_rate": bt["win_rate"],
+                "trades": bt["trades"], "avg_trade": bt["avg_trade"],
+            })
+    if not rows:
+        return {"slices": [], "aggregate": empty_metrics(), "stability": 0.0}
+    rdf = pd.DataFrame(rows)
+    # Aggregate each profile independently across chronological OOS slices.
+    summaries = []
+    for profile, g in rdf.groupby("profile", sort=False):
+        returns = g["return"].astype(float)
+        valid = g["trades"] > 0
+        pos_ratio = float((returns[valid] > 0).mean()) if valid.any() else 0.0
+        median_ret = float(returns[valid].median()) if valid.any() else 0.0
+        pf_vals = pd.to_numeric(g["pf"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
+        summaries.append({
+            "profile": profile,
+            "slices": int(len(g)), "traded_slices": int(valid.sum()),
+            "positive_slice_ratio": pos_ratio * 100,
+            "median_slice_return": median_ret,
+            "mean_slice_return": float(returns.mean()),
+            "median_pf": float(pf_vals.median()) if len(pf_vals) else np.nan,
+            "worst_slice_return": float(returns.min()),
+            "best_slice_return": float(returns.max()),
+            "total_trades": int(g["trades"].sum()),
+        })
+    summary = pd.DataFrame(summaries)
+    base = summary[summary["profile"] == "BASE"]
+    if base.empty:
+        stability = 0.0
+    else:
+        b = base.iloc[0]
+        # Stability score is descriptive, not a probability and not a selection score.
+        stability = float(np.clip(
+            0.35 * b["positive_slice_ratio"] +
+            0.25 * np.clip((b["median_slice_return"] + 0.01) * 2500, 0, 100) +
+            0.20 * np.clip((b["median_pf"] if np.isfinite(b["median_pf"]) else 0) * 40, 0, 100) +
+            0.20 * np.clip((b["traded_slices"] / max(1, b["slices"])) * 100, 0, 100), 0, 100))
+    return {"slices": rdf.to_dict("records"), "summary": summary.to_dict("records"),
+            "stability": stability}
+
+
+def run_repeated_oos_audit(symbols: list[str], cfg: BacktestConfig, max_symbols: int = 6) -> pd.DataFrame:
+    """Cross-symbol repeated OOS audit with frozen parameters."""
+    out = []
+    for symbol in symbols[:max_symbols]:
+        try:
+            df, _ = fetch_ohlcv_fallback(symbol, "1d", 700)
+            if len(df) < 360:
+                continue
+            for direction in ("LONG", "SHORT"):
+                for strategy in ("TREND", "REVERSAL"):
+                    audit = repeated_oos_audit(df, direction, strategy, cfg)
+                    for r in audit.get("summary", []):
+                        out.append({"symbol": symbol, "direction": direction,
+                                    "strategy": strategy, **r,
+                                    "stability": audit.get("stability", 0.0)})
+        except Exception:
+            continue
+    return pd.DataFrame(out)
 
 
 # ============================================================
 # 8. COIN ANALYSIS
 # ============================================================
 
-def analyze_symbol(symbol: str, cfg: BacktestConfig, market_regime: Optional[dict] = None,
-                   enrich: bool = True) -> Optional[dict]:
+def dynamic_execution_gate(market_state: str, sig: dict) -> dict:
+    """Return adaptive execution thresholds for the current market state.
+
+    This is intentionally a gate, not a score boost.  The objective is to reduce
+    false WAIT outcomes caused by one fixed threshold while preserving stricter
+    confirmation when the strategy is exposed to trend/reversal-specific risks.
+    """
+    strategy = sig.get("strategy", "TREND")
+
+    # Baseline: slightly less restrictive than the former fixed 68/1.30/8 gate.
+    score_min, rr_min, gap_min, mtf_min, reversal_min = 65.0, 1.25, 6.0, 44.0, 65.0
+    profile = "BALANCED"
+
+    if market_state == "TREND_UP" or market_state == "TREND_DOWN":
+        score_min, rr_min, gap_min, mtf_min = 67.0, 1.25, 7.0, 46.0
+        profile = "TREND"
+    elif market_state in {"EXHAUSTION_UP", "EXHAUSTION_DOWN"}:
+        score_min, rr_min, gap_min, reversal_min = 64.0, 1.20, 5.0, 64.0
+        profile = "EXHAUSTION"
+    elif market_state == "TRANSITION":
+        score_min, rr_min, gap_min = 63.0, 1.25, 5.0
+        profile = "TRANSITION"
+    elif market_state == "RANGE":
+        # Range is still selective because directional continuation has less edge.
+        score_min, rr_min, gap_min = 66.0, 1.35, 8.0
+        profile = "RANGE"
+
+    # Reversal entries need evidence, but should not be forced to meet a trend
+    # MTF alignment requirement because the whole point is regime transition.
+    if strategy == "REVERSAL":
+        mtf_min = 35.0
+        score_min = min(score_min, 65.0)
+        reversal_min = max(reversal_min, 64.0)
+
+    return {
+        "score_min": float(score_min),
+        "rr_min": float(rr_min),
+        "gap_min": float(gap_min),
+        "mtf_min": float(mtf_min),
+        "reversal_min": float(reversal_min),
+        "profile": profile,
+    }
+
+
+def analyze_symbol(symbol: str, cfg: BacktestConfig, use_mtf: bool = True) -> Optional[dict]:
+    """Current-market decision engine. MTF can be deferred for speed."""
     try:
-        df, exchange_id = fetch_ohlcv_fallback(symbol, "1d", cfg.data_limit)
-        if len(df) < max(260, cfg.train_bars + cfg.test_bars):
+        df, exchange_id = fetch_ohlcv_fallback(symbol, "1d", 700)
+        if len(df) < max(300, cfg.train_bars + cfg.test_bars + 30):
             return None
-
-        long_wf = walk_forward(df, "LONG", cfg)
-        short_wf = walk_forward(df, "SHORT", cfg)
-
         latest = df.iloc[-1]
-        btc_ret_30 = float(market_regime.get("btc_ret_30", np.nan)) if market_regime else np.nan
-        coin_ret_30 = float(latest["Close"] / df["Close"].iloc[-31] - 1)
-        relative_strength_30 = coin_ret_30 - btc_ret_30 if np.isfinite(btc_ret_30) else np.nan
-        deriv = fetch_derivatives_snapshot(symbol) if enrich else {"funding": np.nan, "oi_value": np.nan}
-        mtf = fetch_mtf_confirmation(symbol) if (enrich and cfg.use_mtf) else {"score": 50.0, "label": "OFF"}
-        df = df.copy()
-        df["FUNDING"] = deriv.get("funding", np.nan)
-
-        candidates = []
-        for direction, wf in [("LONG", long_wf), ("SHORT", short_wf)]:
-            if wf["trades"] < cfg.min_oos_trades:
-                continue
-
-            sig = generate_signal(df, direction, market_regime=market_regime)
-            if sig is None:
-                continue
-
-            # OOS-focused score. MDD is a penalty, not a standalone ranking.
-            pf_component = min(max(wf["profit_factor"], 0), 4) / 4 * 25
-            ret_component = np.clip(wf["total_return"] * 100, -25, 25)
-            win_component = np.clip(wf["win_rate"] - 40, 0, 40) / 40 * 20
-            stability = (
-                np.mean([w["oos_return"] > 0 for w in wf["windows"]])
-                if wf["windows"] else 0
-            )
-            dd_penalty = min(abs(wf["max_drawdown"]) * 100, 30)
-            rs_component = float(np.clip(relative_strength_30 * 100, -15, 15))
-            funding = deriv.get("funding", np.nan)
-            funding_component = 0.0
-            if np.isfinite(funding):
-                # Extreme positive funding penalizes LONG; extreme negative funding penalizes SHORT.
-                funding_component = float(np.clip((-funding if direction == "LONG" else funding) * 10000, -5, 5))
-
-                # MTF must be direction-aligned: a bullish 4H state helps LONG
-            # but should penalize SHORT, and vice versa.
-            mtf_alignment = (mtf["score"] - 50.0) if direction == "LONG" else (50.0 - mtf["score"])
-
-            score = (
-                sig["score"] * 0.45
-                + pf_component * 0.20
-                + ret_component * 0.10
-                + win_component * 0.10
-                + stability * 10
-                - dd_penalty * 0.15
-                + rs_component * 0.12
-                + funding_component * 0.8
-                + mtf_alignment * 0.10
-                + (wf.get("param_stability", 0.0) * 5.0)
-            )
-            score = float(np.clip(score, 0, 100))
-            # Keep a direction candidate for diagnostics. The final decision
-            # layer will turn low scores into NEUTRAL instead of silently
-            # deleting the coin from the result set.
-            candidates.append({
-                "direction": direction,
-                "score": score,
-                "signal": sig,
-                "wf": wf,
-            })
-
+        mtf = fetch_mtf_context(symbol) if use_mtf else {}
+        long_trend = generate_signal(df, "LONG", mtf=mtf, strategy="TREND")
+        short_trend = generate_signal(df, "SHORT", mtf=mtf, strategy="TREND")
+        long_rev = generate_signal(df, "LONG", mtf=mtf, strategy="REVERSAL")
+        short_rev = generate_signal(df, "SHORT", mtf=mtf, strategy="REVERSAL")
+        candidates = [x for x in (long_trend, short_trend, long_rev, short_rev) if x is not None]
         if not candidates:
             return None
 
-        candidates.sort(key=lambda x: x["score"], reverse=True)
-        best = candidates[0]
-        second = candidates[1] if len(candidates) > 1 else None
-        score_gap = best["score"] - second["score"] if second else best["score"]
+        # Regime chooses which engine is allowed to compete, rather than WFO.
+        state = classify_market_state(df)
+        if state["state"] == "TREND_UP":
+            allowed = [x for x in candidates if x["direction"] == "LONG" and x["strategy"] == "TREND"]
+        elif state["state"] == "TREND_DOWN":
+            allowed = [x for x in candidates if x["direction"] == "SHORT" and x["strategy"] == "TREND"]
+        elif state["state"] == "EXHAUSTION_UP":
+            allowed = [x for x in candidates if x["direction"] == "SHORT" and x["strategy"] == "REVERSAL"]
+        elif state["state"] == "EXHAUSTION_DOWN":
+            allowed = [x for x in candidates if x["direction"] == "LONG" and x["strategy"] == "REVERSAL"]
+        else:
+            allowed = candidates
+        if not allowed:
+            allowed = candidates
+        best_sig = max(allowed, key=lambda x: (x["score"], x["rr"]))
+        opposite = [x for x in candidates if x["direction"] != best_sig["direction"]]
+        opp_score = max([x["score"] for x in opposite], default=0.0)
+        score_gap = best_sig["score"] - opp_score
 
-        # Keep an explicit NEUTRAL decision when evidence is insufficient or
-        # LONG/SHORT evidence is too close. This prevents the UI from silently
-        # converting uncertainty into a directional trade idea.
-        neutral_reason = None
-        if best["score"] < cfg.min_direction_score:
-            neutral_reason = "방향성 점수 미달"
-        elif second is not None and score_gap < cfg.neutral_score_gap:
-            neutral_reason = "LONG/SHORT 점수 차이 부족"
+        reasons = [f"시장상태 {state['state']}", f"전략 {best_sig['strategy']}"]
+        if best_sig["mtf_score"] >= 65: reasons.append("MTF 정렬")
+        elif best_sig["mtf_score"] < 50: reasons.append("MTF 충돌")
+        if best_sig["rr"] >= 1.8: reasons.append("기대 R:R 양호")
+        elif best_sig["rr"] < 1.3: reasons.append("R:R 부족")
 
-        if neutral_reason is not None:
-            return {
-                "symbol": symbol,
-                "exchange": exchange_id,
-                "price": float(latest["Close"]),
-                "change_30d": float((latest["Close"] / df["Close"].iloc[-31] - 1) * 100),
-                "direction": "NEUTRAL",
-                "score": float(best["score"]),
-                "score_gap": float(score_gap),
-                "decision_reason": neutral_reason,
-                "signal": best["signal"],
-                "factor_positive": [],
-                "factor_negative": [],
-                "wf": best["wf"],
-                "rsi": float(latest["RSI14"]),
-                "adx": float(latest["ADX14"]),
-                "atr_pct": float(latest["ATR_PCT"]),
-                "poc": float(latest["POC_Price"]),
-                "rel_volume": float(latest["REL_VOLUME"]),
-                "relative_strength_30": relative_strength_30,
-                "funding": deriv.get("funding", np.nan),
-                "oi_value": deriv.get("oi_value", np.nan),
-                "mtf_score": mtf["score"],
-                "mtf_label": mtf["label"],
-                "oos_time_sharpe": best["wf"].get("time_sharpe", np.nan),
-                "param_stability": best["wf"].get("param_stability", np.nan),
-                "mc_p05": best["wf"].get("mc_p05", np.nan),
-                "mc_median": best["wf"].get("mc_median", np.nan),
-                "mc_p95": best["wf"].get("mc_p95", np.nan),
-                "mc_mdd_q05": best["wf"].get("mc_mdd_q05", np.nan),
-            }
-
-        # Explain the selected direction using auditable factor contributions.
-        sig = best["signal"]
-        comp = {k: float(v) for k, v in sig.items() if k in {"trend", "momentum", "structure", "volume", "volatility", "derivatives"}}
-        positive = sorted(comp.items(), key=lambda kv: kv[1], reverse=True)[:3]
-        negative = sorted(comp.items(), key=lambda kv: kv[1])[:2]
+        # Dynamic current-market gate. WFO is NOT a hard gate.
+        # The threshold adapts to regime/strategy so the engine does not become
+        # artificially selective in transition/range markets, while strong trends
+        # still require stronger confirmation.
+        gate = dynamic_execution_gate(state["state"], best_sig)
+        strong = (
+            best_sig["score"] >= gate["score_min"]
+            and best_sig["rr"] >= gate["rr_min"]
+            and score_gap >= gate["gap_min"]
+        )
+        if best_sig["strategy"] == "REVERSAL":
+            strong = strong and best_sig["reversal_score"] >= gate["reversal_min"]
+        if best_sig["mtf_score"] < gate["mtf_min"] and best_sig["strategy"] == "TREND":
+            strong = False
+        status = best_sig["direction"] if strong else "WAIT"
+        if status == "WAIT":
+            if score_gap < gate["gap_min"]: wait_reason = f"방향 우세 부족({score_gap:.0f}<{gate['gap_min']:.0f})"
+            elif best_sig["rr"] < gate["rr_min"]: wait_reason = f"기대 R:R 부족({best_sig['rr']:.2f}<{gate['rr_min']:.2f})"
+            elif best_sig["strategy"] == "REVERSAL" and best_sig["reversal_score"] < gate["reversal_min"]: wait_reason = "역추세 반전 증거 부족"
+            elif best_sig["strategy"] == "TREND" and best_sig["mtf_score"] < gate["mtf_min"]: wait_reason = "추세 MTF 확인 부족"
+            else: wait_reason = "현재 구조의 실행 조건 미충족"
+            reasons.insert(0, wait_reason)
+        reasons.append(f"Gate {gate['profile']}")
 
         return {
-            "symbol": symbol,
-            "exchange": exchange_id,
-            "price": float(latest["Close"]),
-            "change_30d": float(
-                (latest["Close"] / df["Close"].iloc[-31] - 1) * 100
-            ),
-            "direction": best["direction"],
-            "score": best["score"],
-            "decision_reason": "LONG/SHORT 점수차 및 최소 점수 기준 충족",
-            "score_gap": float(score_gap),
-            "signal": best["signal"],
-            "factor_positive": positive,
-            "factor_negative": negative,
-            "wf": best["wf"],
-            "rsi": float(latest["RSI14"]),
-            "adx": float(latest["ADX14"]),
-            "atr_pct": float(latest["ATR_PCT"]),
-            "poc": float(latest["POC_Price"]),
-            "rel_volume": float(latest["REL_VOLUME"]),
-            "relative_strength_30": relative_strength_30,
-            "funding": deriv.get("funding", np.nan),
-            "oi_value": deriv.get("oi_value", np.nan),
-            "mtf_score": mtf["score"],
-            "mtf_label": mtf["label"],
-            "oos_time_sharpe": best["wf"].get("time_sharpe", np.nan),
-            "param_stability": best["wf"].get("param_stability", np.nan),
-            "mc_p05": best["wf"].get("mc_p05", np.nan),
-            "mc_median": best["wf"].get("mc_median", np.nan),
-            "mc_p95": best["wf"].get("mc_p95", np.nan),
-            "mc_mdd_q05": best["wf"].get("mc_mdd_q05", np.nan),
+            "symbol": symbol, "exchange": exchange_id, "price": float(latest["Close"]),
+            "change_30d": float((latest["Close"] / df["Close"].iloc[-31] - 1) * 100),
+            "direction": status, "signal_direction": best_sig["direction"],
+            "score": float(best_sig["score"]), "signal": best_sig,
+            "wf": empty_metrics(), "rsi": float(latest["RSI14"]), "adx": float(latest["ADX14"]),
+            "atr_pct": float(latest["ATR_PCT"]), "poc": float(latest["POC_Price"]),
+            "rel_volume": float(latest["REL_VOLUME"]), "reason": " · ".join(reasons),
+            "score_gap": float(score_gap), "status_pass": bool(status in {"LONG", "SHORT"}),
+            "df": df, "cfg": cfg,
         }
     except Exception:
         return None
 
 
+def wfo_robustness_score(wf: dict, strategy: str) -> float:
+    """Convert OOS robustness into a bounded 0-100 *validation* score.
 
-def fast_screen(symbol: str, market_regime: Optional[dict] = None, min_score: float = 42.0) -> Optional[dict]:
-    """Cheap current-state screen. No WFO, derivatives, MTF or Monte Carlo."""
-    try:
-        df, exchange_id = fetch_ohlcv_fallback(symbol, "1d", 260)
-        if len(df) < 220:
-            return None
-        r = df.iloc[-1]
-        if any(pd.isna(r.get(c)) for c in ["EMA20","EMA50","EMA200","RSI14","MACD_HIST","ROC14","ADX14","ATR14","ATR_PCT","REL_VOLUME","VOL_Z","POC_Price"]):
-            return None
-        scores = {}
-        for d in ("LONG", "SHORT"):
-            sig = generate_signal(df, d, market_regime=market_regime)
-            scores[d] = sig["score"] if sig else 0.0
-        best_dir = max(scores, key=scores.get)
-        best_score = float(scores[best_dir])
-        if best_score < min_score:
-            return None
-        return {"symbol": symbol, "exchange": exchange_id, "screen_score": best_score, "direction": best_dir}
-    except Exception:
-        return None
+    This is not a probability and is intentionally capped as a small modifier
+    to the live-market score. Positive-window consistency matters more than one
+    spectacular OOS run.
+    """
+    trades = int(wf.get("trades", 0))
+    windows = wf.get("windows", []) or []
+    if trades < 5 or len(windows) < 3:
+        return np.nan
+    pf = float(wf.get("profit_factor", 0.0))
+    ret = float(wf.get("total_return", 0.0))
+    mdd = abs(float(wf.get("max_drawdown", 0.0)))
+    positive = float(np.mean([w.get("oos_return", 0.0) > 0 for w in windows]))
+    median_win = float(np.median([w.get("oos_return", 0.0) for w in windows]))
+    active = [w for w in windows if w.get("oos_trades", 0) > 0]
+    coverage = len(active) / max(len(windows), 1)
+    score = 45.0
+    score += coverage * 8.0
+    score += min(max(pf - 1.0, 0.0), 2.0) * 12.0
+    score += min(max(ret, -0.2), 0.5) * 25.0
+    score += positive * 18.0
+    score += np.clip(median_win, -0.10, 0.20) * 25.0
+    score -= min(mdd, 0.30) * 35.0
+    # Reversal deserves a small conservatism penalty because fewer setups and
+    # regime dependence make its OOS sample more fragile.
+    if strategy == "REVERSAL":
+        score -= 3.0
+    return float(np.clip(score, 0, 100))
 
-def run_parallel(symbols: list[str], cfg: BacktestConfig,
-                 workers: int = 6, market_regime: Optional[dict] = None,
-                 enrich: bool = True) -> pd.DataFrame:
-    rows = []
-    errors = 0
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(analyze_symbol, s, cfg, market_regime, enrich) for s in symbols]
-        for f in concurrent.futures.as_completed(futures):
-            try:
-                r = f.result()
-                if r:
-                    rows.append(r)
-            except Exception:
-                errors += 1
 
-    # Keep the UI resilient; expose count for diagnostics instead of leaking API errors.
+def apply_adaptive_wfo(rows: list[dict], cfg: BacktestConfig) -> None:
+    """Apply WFO as a capped robustness modifier, never as a hard gate.
 
+    88% current-market evidence + up to 12% WFO robustness when enough OOS
+    evidence exists. With insufficient WFO evidence the live score is untouched.
+    """
+    for r in rows:
+        wf = r.get("wf", {})
+        wscore = wfo_robustness_score(wf, r["signal"].get("strategy", "TREND"))
+        r["wfo_score"] = None if not np.isfinite(wscore) else float(wscore)
+        if np.isfinite(wscore):
+            # Adaptive evidence weight: WFO earns influence only when its OOS
+            # sample is large enough. It can never exceed 12% of the final score.
+            trades = int(wf.get("trades", 0))
+            windows = len(wf.get("windows", []) or [])
+            pf = float(wf.get("profit_factor", 0.0))
+            if trades >= max(15, cfg.wfo_min_trades * 3) and windows >= max(8, cfg.wfo_min_windows + 5) and pf >= 1.20:
+                w = float(cfg.wfo_weight_max)
+            elif trades >= cfg.wfo_min_trades * 2 and windows >= cfg.wfo_min_windows + 2:
+                w = min(float(cfg.wfo_weight_max), 0.08)
+            else:
+                w = min(float(cfg.wfo_weight_max), 0.05)
+            base = float(r["score"])
+            r["score_raw"] = base
+            r["score"] = float((1.0 - w) * base + w * wscore)
+            r["wfo_weight"] = w
+        else:
+            r["score_raw"] = float(r["score"])
+            r["wfo_weight"] = 0.0
+
+
+def _candidate_return_series(row: dict, bars: int = 90) -> pd.Series:
+    """Return aligned daily returns for portfolio-correlation checks."""
+    df = row.get("df")
+    if df is None or "Close" not in df.columns:
+        return pd.Series(dtype=float)
+    close = pd.to_numeric(df["Close"], errors="coerce").dropna().tail(bars + 1)
+    if len(close) < 20:
+        return pd.Series(dtype=float)
+    ret = np.log(close / close.shift(1)).dropna()
+    ret.name = row.get("symbol", "")
+    return ret
+
+
+def _pair_corr(a: dict, b: dict) -> float:
+    """Correlation of recent daily returns; NaN means insufficient evidence."""
+    ra = _candidate_return_series(a)
+    rb = _candidate_return_series(b)
+    if ra.empty or rb.empty:
+        return np.nan
+    x = pd.concat([ra, rb], axis=1).dropna()
+    if len(x) < 20:
+        return np.nan
+    c = float(x.iloc[:, 0].corr(x.iloc[:, 1]))
+    return c if np.isfinite(c) else np.nan
+
+
+def select_portfolio_candidates(
+    rows: list[dict],
+    max_candidates: int = 3,
+    max_same_direction: int = 2,
+    corr_limit: float = 0.75,
+) -> list[dict]:
+    """Select a small diversified execution set from actionable signals.
+
+    This is not a prediction layer. It reduces redundant exposure when several
+    coins express essentially the same daily return stream. The first candidate
+    is the strongest live-market signal; subsequent candidates must add enough
+    diversification or be materially stronger than an already-selected signal.
+    """
+    candidates = [r for r in rows if r.get("direction") in {"LONG", "SHORT"}]
+    for r in rows:
+        r["portfolio_selected"] = False
+        r["portfolio_rank"] = None
+        r["portfolio_score"] = np.nan
+        r["max_selected_corr"] = np.nan
+        r["portfolio_reason"] = ""
+
+    if not candidates:
+        return []
+
+    # Use the final QUANT score, then R:R and score gap as tie-breakers.
+    remaining = sorted(
+        candidates,
+        key=lambda r: (
+            float(r.get("score", 0.0)),
+            float(r.get("signal", {}).get("rr", 0.0)),
+            float(r.get("score_gap", 0.0)),
+        ),
+        reverse=True,
+    )
+
+    selected = []
+    while remaining and len(selected) < max_candidates:
+        best = None
+        best_key = None
+        for r in remaining:
+            same_dir = sum(x.get("signal_direction") == r.get("signal_direction") for x in selected)
+            if same_dir >= max_same_direction:
+                continue
+
+            corrs = [_pair_corr(r, x) for x in selected]
+            valid_corrs = [abs(c) for c in corrs if np.isfinite(c)]
+            max_corr = max(valid_corrs) if valid_corrs else 0.0
+
+            # Penalize redundant exposure. A highly correlated candidate can still
+            # enter if it is clearly stronger, but it pays a meaningful penalty.
+            redundancy_penalty = max(0.0, max_corr - 0.35) * 28.0
+            same_dir_penalty = 3.0 if selected and same_dir > 0 else 0.0
+            pscore = float(r.get("score", 0.0)) - redundancy_penalty - same_dir_penalty
+
+            # Hard correlation cap unless this is materially stronger than all
+            # currently selected alternatives. This prevents BTC/ETH/SOL-like
+            # clusters from consuming the entire 3-slot execution list.
+            blocked = bool(valid_corrs and max_corr >= corr_limit and pscore < float(r.get("score", 0.0)) - 4.0)
+            if blocked:
+                continue
+
+            key = (pscore, float(r.get("signal", {}).get("rr", 0.0)), -max_corr)
+            if best is None or key > best_key:
+                best = (r, pscore, max_corr)
+                best_key = key
+
+        if best is None:
+            break
+
+        r, pscore, max_corr = best
+        r["portfolio_selected"] = True
+        r["portfolio_rank"] = len(selected) + 1
+        r["portfolio_score"] = float(pscore)
+        r["max_selected_corr"] = float(max_corr) if np.isfinite(max_corr) else np.nan
+        if not selected:
+            r["portfolio_reason"] = "최종 QUANT 1위 후보"
+        elif np.isfinite(max_corr) and max_corr >= corr_limit:
+            r["portfolio_reason"] = f"강한 상관에도 점수 우위(상관 {max_corr:.2f})"
+        elif np.isfinite(max_corr):
+            r["portfolio_reason"] = f"분산효과 확보(상관 {max_corr:.2f})"
+        else:
+            r["portfolio_reason"] = "상관 데이터 부족, 점수·R:R 기준"
+        selected.append(r)
+        remaining.remove(r)
+
+    # Explain why strong actionable candidates were not selected.
+    selected_set = {id(x) for x in selected}
+    for r in candidates:
+        if id(r) in selected_set:
+            continue
+        corr_to_selected = [_pair_corr(r, x) for x in selected]
+        valid = [abs(c) for c in corr_to_selected if np.isfinite(c)]
+        if valid and max(valid) >= corr_limit:
+            r["portfolio_reason"] = f"중복노출 방지(상관 {max(valid):.2f})"
+        else:
+            r["portfolio_reason"] = "상위 3개 외 후보"
+        r["max_selected_corr"] = max(valid) if valid else np.nan
+
+    return selected
+
+
+def apply_position_sizing(rows: list[dict], cfg: BacktestConfig) -> list[dict]:
+    """Risk-based sizing for the selected execution portfolio.
+
+    Size is determined from account risk and the actual Entry/SL distance, not
+    from nominal coin price. Portfolio risk is capped across selected trades.
+    This is a sizing layer only; it does not change signal direction.
+    """
+    selected = [r for r in rows if r.get("portfolio_selected")]
+    if not selected or cfg.account_size <= 0:
+        return rows
+
+    total_budget = cfg.account_size * cfg.max_portfolio_risk
+    base_budget = min(cfg.account_size * cfg.risk_per_trade, total_budget / max(len(selected), 1))
+    remaining_budget = total_budget
+
+    # Stronger portfolio candidates receive their normal risk budget first.
+    selected = sorted(selected, key=lambda r: int(r.get("portfolio_rank") or 999))
+    for r in selected:
+        sig = r.get("signal", {})
+        entry = float(sig.get("entry", r.get("price", np.nan)))
+        sl = float(sig.get("sl", np.nan))
+        tp = float(sig.get("tp", np.nan))
+        if not (np.isfinite(entry) and np.isfinite(sl) and entry > 0 and sl > 0):
+            continue
+
+        stop_pct = abs(entry - sl) / entry
+        if stop_pct <= 0:
+            continue
+
+        # Never let one position consume more than max_position_weight of equity.
+        risk_budget = min(base_budget, remaining_budget)
+        notional = min(risk_budget / stop_pct, cfg.account_size * cfg.max_position_weight)
+        risk_used = notional * stop_pct
+
+        r["risk_budget"] = float(risk_budget)
+        r["stop_pct"] = float(stop_pct * 100.0)
+        r["position_notional"] = float(notional)
+        r["position_weight"] = float(notional / cfg.account_size * 100.0)
+        r["risk_used"] = float(risk_used)
+        r["tp_pct"] = float(abs(tp - entry) / entry * 100.0) if np.isfinite(tp) else np.nan
+        r["portfolio_risk_after"] = float((total_budget - max(0.0, remaining_budget - risk_used)) / cfg.account_size * 100.0)
+        remaining_budget = max(0.0, remaining_budget - risk_used)
+
+    total_used = sum(float(r.get("risk_used", 0.0)) for r in selected)
+    for r in rows:
+        r["portfolio_risk_total"] = float(total_used / cfg.account_size * 100.0) if cfg.account_size > 0 else 0.0
+    return rows
+
+
+def attach_validation(rows: list[dict], cfg: BacktestConfig, max_validate: int = 5) -> pd.DataFrame:
+    """Run OOS only on the best actionable/near-actionable candidates.
+
+    The 1D dataframe produced by the first pass is retained until validation, so
+    WFO does not issue another 1D download for the same symbol.
+    """
     if not rows:
         return pd.DataFrame()
 
-    out = pd.DataFrame(rows)
-    return out.sort_values("score", ascending=False, na_position="last").reset_index(drop=True)
+    rows = sorted(rows, key=lambda x: (x["status_pass"], x["score"], x["score_gap"]), reverse=True)
+
+    # Prefer actual execution candidates, then the strongest WAIT candidates as
+    # diagnostics. This avoids spending OOS time on weak rows.
+    validation_pool = [r for r in rows if r.get("status_pass")]
+    if len(validation_pool) < max_validate:
+        validation_pool += [r for r in rows if not r.get("status_pass")]
+    validation_pool = validation_pool[:max_validate]
+
+    for r in validation_pool:
+        try:
+            df = r.get("df")
+            if df is None or len(df) < 260:
+                df, _ = fetch_ohlcv_fallback(r["symbol"], "1d", 700)
+            strategy = r["signal"].get("strategy", "TREND")
+            wf = walk_forward(df, r["signal_direction"], cfg, strategy) if len(df) >= 260 else empty_metrics()
+            r["wf"] = wf
+            r["wfo_strategy"] = strategy
+            r["reason"] += f" · OOS({strategy}) PF {wf['profit_factor']:.2f}" if wf["trades"] else " · OOS 검증 표본 부족"
+        except Exception:
+            r["wf"] = empty_metrics()
+
+    apply_adaptive_wfo(rows, cfg)
+    select_portfolio_candidates(rows, max_candidates=3, max_same_direction=2, corr_limit=0.75)
+    apply_position_sizing(rows, cfg)
+
+    # Remove large dataframes before DataFrame construction/session storage.
+    for r in rows:
+        r.pop("df", None)
+        r.pop("cfg", None)
+    return pd.DataFrame(rows)
+
+
+def run_parallel(symbols: list[str], cfg: BacktestConfig, workers: int = 6) -> pd.DataFrame:
+    """Two-stage scan: cheap 1D prefilter, then MTF only for strongest candidates.
+
+    This cuts the expensive 1D/4H/1H request fan-out substantially while keeping
+    MTF in the final decision. Cached 1D data makes the second pass inexpensive.
+    """
+    rows = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(analyze_symbol, s, cfg, False) for s in symbols]
+        for f in concurrent.futures.as_completed(futures):
+            try:
+                r = f.result()
+                if r: rows.append(r)
+            except Exception:
+                pass
+
+    # Only the strongest 12 current-market candidates receive the full MTF pass.
+    # This is the main speed optimization for 30-coin scans (12 x 3 TF instead
+    # of 30 x 3 TF), while preserving MTF for the candidates that can matter.
+    shortlist_n = min(12, len(rows))
+    shortlist = sorted(rows, key=lambda x: (x["status_pass"], x["score"], x["score_gap"]), reverse=True)[:shortlist_n]
+    symbols_short = [r["symbol"] for r in shortlist]
+
+    refined = []
+    if symbols_short:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(analyze_symbol, s, cfg, True) for s in symbols_short]
+            for f in concurrent.futures.as_completed(futures):
+                try:
+                    r = f.result()
+                    if r: refined.append(r)
+                except Exception:
+                    pass
+
+    refined_map = {r["symbol"]: r for r in refined}
+    final_rows = [refined_map.get(r["symbol"], r) for r in rows]
+    return attach_validation(final_rows, cfg, max_validate=5)
 
 
 # ============================================================
@@ -1160,16 +1716,13 @@ def render_regime():
 
     st.subheader("🌐 시장 레짐")
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("BTC", fmt_price(float(regime["btc"]["Close"])) if regime["btc"] is not None else "-")
     with c2:
         st.metric("BTC 레짐", regime["label"])
     with c3:
         st.metric("시장 점수", f"{regime['score']:.0f}/100")
-    with c4:
-        btcd = regime.get("btcd", np.nan)
-        st.metric("BTC Dominance", f"{btcd:.1f}%" if np.isfinite(btcd) else "-")
 
     if regime["details"]:
         st.caption(" · ".join(regime["details"]))
@@ -1180,40 +1733,46 @@ def render_regime():
 def render_mobile_card(row: pd.Series):
     direction = row["direction"]
     icon = "🟢" if direction == "LONG" else ("🔴" if direction == "SHORT" else "⚪")
-
+    sig = row["signal"]
     with st.container(border=True):
         st.markdown(f"### {icon} {row['symbol']} · {direction}")
-        a, b, c = st.columns(3)
+        a, b, c, d = st.columns(4)
         a.metric("QUANT", f"{row['score']:.0f}")
         b.metric("현재가", fmt_price(row["price"]))
-        c.metric("RR", f"{row['signal']['rr']:.2f}" if direction != "NEUTRAL" else "-")
-
+        c.metric("R:R", f"1 : {sig['rr']:.2f}")
+        d.metric("MTF", f"{sig['mtf_score']:.0f}")
         a, b, c = st.columns(3)
-        a.metric("TP", fmt_price(row["signal"]["tp"]) if direction != "NEUTRAL" else "-")
-        b.metric("SL", fmt_price(row["signal"]["sl"]) if direction != "NEUTRAL" else "-")
-        c.metric("ADX", f"{row['adx']:.1f}")
+        a.metric("ENTRY ZONE", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
+        b.metric("SL", fmt_price(sig["sl"]))
+        c.metric("🎯 TP", fmt_price(sig["tp"]))
+        a, b, c = st.columns(3)
+        a.metric("전략", sig["strategy"])
+        b.metric("시장상태", sig["market_state"])
+        c.metric("방향차", f"{row['score_gap']:.1f}")
+        st.caption(f"RSI {row['rsi']:.1f} · ATR {row['atr_pct']:.2f}% · POC {fmt_price(row['poc'])} · RVOL {row['rel_volume']:.2f}")
+        st.caption("판정: " + str(row.get("reason", "-")))
 
-        rs = row.get("relative_strength_30", np.nan)
-        funding = row.get("funding", np.nan)
-        rs_text = f"RS(BTC) {rs*100:+.2f}%" if np.isfinite(rs) else "RS(BTC) -"
-        fund_text = f"Funding {funding*100:.4f}%" if np.isfinite(funding) else "Funding -"
-        mtf_text = f"4H {row.get('mtf_label', '-') }"
-        mc = row.get("mc_median", np.nan)
-        mc_text = f"MC50 {mc*100:+.1f}%" if np.isfinite(mc) else "MC50 -"
-        gap_text = f"Gap {row.get('score_gap', np.nan):.1f}" if np.isfinite(row.get('score_gap', np.nan)) else "Gap -"
-        reason_text = row.get("decision_reason", "")
-        st.caption(
-            f"RSI {row['rsi']:.1f} · ATR {row['atr_pct']:.2f}% · "
-            f"POC {fmt_price(row['poc'])} · RVOL {row['rel_volume']:.2f} · {rs_text} · {fund_text} · {mtf_text} · {mc_text} · {gap_text}"
+def render_portfolio_candidates(df: pd.DataFrame):
+    selected = df[df.get("portfolio_selected", False) == True].copy() if "portfolio_selected" in df else pd.DataFrame()
+    if selected.empty:
+        st.info("현재 조건에서 포트폴리오 실행 후보가 없습니다. 개별 신호는 WAIT/후보 상태를 확인하세요.")
+        return
+
+    selected = selected.sort_values("portfolio_rank")
+    st.markdown("### 🧩 최종 실행 포트폴리오")
+    st.caption("상관이 높은 종목의 중복 노출을 줄이고, 최대 3개 신호만 실행 후보로 압축합니다.")
+    for _, row in selected.iterrows():
+        sig = row["signal"]
+        icon = "🟢" if row["direction"] == "LONG" else "🔴"
+        corr_txt = f" · 선택후보 상관 {row['max_selected_corr']:.2f}" if np.isfinite(row.get("max_selected_corr", np.nan)) else ""
+        st.info(
+            f"{icon} **#{int(row['portfolio_rank'])} {row['symbol']} {row['direction']}** · "
+            f"QUANT {row['score']:.0f} · {sig['strategy']} · {sig['market_state']} · "
+            f"Entry {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} · "
+            f"SL {fmt_price(sig['sl'])} · 🎯 TP {fmt_price(sig['tp'])} · R:R 1:{sig['rr']:.2f}"
+            f"{corr_txt}"
         )
-        if reason_text:
-            st.caption(f"판정: {reason_text}")
-        pos = row.get("factor_positive", [])
-        neg = row.get("factor_negative", [])
-        if pos:
-            st.caption("근거: " + ", ".join(f"{k} {v:+.0f}" for k, v in pos))
-        if neg:
-            st.caption("주의: " + ", ".join(f"{k} {v:+.0f}" for k, v in neg))
+        st.caption(str(row.get("portfolio_reason", "")))
 
 
 def render_results(df: pd.DataFrame):
@@ -1230,35 +1789,46 @@ def render_results(df: pd.DataFrame):
     display["PF"] = display["wf"].apply(lambda x: x["profit_factor"]).round(2)
     display["MDD"] = (display["wf"].apply(lambda x: x["max_drawdown"]) * 100).round(2)
     display["Trades"] = display["wf"].apply(lambda x: x["trades"])
-    display["TSharpe"] = display["wf"].apply(lambda x: x.get("time_sharpe", np.nan)).round(2)
-    display["Stability"] = (display["wf"].apply(lambda x: x.get("param_stability", np.nan)) * 100).round(0)
-    display["MC50"] = (display["wf"].apply(lambda x: x.get("mc_median", np.nan)) * 100).round(1)
-    display["Gap"] = display["score_gap"].round(1)
-    display["RS30"] = (display["relative_strength_30"] * 100).round(2)
-    display["Funding"] = (display["funding"] * 100).round(4)
+    display["RR"] = display["signal"].apply(lambda x: x["rr"]).round(2)
+    display["MTF"] = display["signal"].apply(lambda x: x["mtf_score"]).round(0)
+    display["WFO"] = display["wfo_score"].round(0) if "wfo_score" in display else np.nan
+    display["Base"] = display["score_raw"].round(0) if "score_raw" in display else display["score"].round(0)
+    display["WFO비중"] = (display["wfo_weight"] * 100).round(0) if "wfo_weight" in display else 0
+    display["포트폴리오"] = display["portfolio_rank"].apply(lambda x: f"#{int(x)}" if pd.notna(x) else "-") if "portfolio_rank" in display else "-"
+    display["선택상관"] = display["max_selected_corr"].round(2) if "max_selected_corr" in display else np.nan
+    display["포지션"] = display["position_notional"].round(0) if "position_notional" in display else np.nan
+    display["비중"] = display["position_weight"].round(1) if "position_weight" in display else np.nan
+    display["SL위험"] = display["risk_used"].round(0) if "risk_used" in display else np.nan
 
-    cols = ["symbol", "direction", "score", "Gap", "price", "30D", "RS30", "Funding", "OOS", "Win", "PF", "MDD", "TSharpe", "Stability", "MC50", "Trades"]
+    display["Status"] = display["direction"]
+    display["판정사유"] = display["reason"]
+    cols = ["symbol", "Status", "포트폴리오", "signal_direction", "score", "Base", "price", "30D", "RR", "MTF", "WFO", "WFO비중", "OOS", "Win", "PF", "MDD", "Trades", "선택상관", "포지션", "비중", "SL위험", "판정사유"]
     st.dataframe(
         display[cols],
         use_container_width=True,
         hide_index=True,
         column_config={
             "symbol": "종목",
-            "direction": "신호",
-            "score": "QUANT",
-            "Gap": "LONG/SHORT 점수차",
+            "Status": "최종판정",
+            "signal_direction": "분석방향",
+            "score": "최종 QUANT",
+            "Base": "현재시장 점수",
             "price": "현재가",
             "30D": "30D%",
-            "RS30": "BTC 대비 RS%",
-            "Funding": "Funding%",
             "OOS": "OOS%",
             "Win": "승률%",
             "PF": "PF",
             "MDD": "MDD%",
             "Trades": "거래수",
-            "TSharpe": "시간기반 Sharpe",
-            "Stability": "파라미터 안정성%",
-            "MC50": "MC 중앙값%",
+            "RR": "R:R",
+            "MTF": "MTF",
+            "WFO": "WFO 견고성",
+            "WFO비중": "WFO 반영%",
+            "포트폴리오": "최종 실행순위",
+            "선택상관": "선택후보 상관",
+            "포지션": "권장 포지션(USDT)",
+            "비중": "계좌비중%",
+            "SL위험": "SL 위험금액",
         },
     )
 
@@ -1268,8 +1838,8 @@ def render_results(df: pd.DataFrame):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V2.5")
-    st.caption("확정봉 · Look-ahead 방지 · Rolling WFO · 비용반영 · BTC.D · ETH/BTC · RS · Derivatives · MTF · Monte Carlo · 모바일 최적화")
+    st.title("🔥 Crypto Quant Dashboard V2")
+    st.caption("확정봉 · Look-ahead 방지 · 1D/4H/1H MTF · Trend/Reverse · 단일 최적 TP/SL · WFO/OOS 참고")
 
     with st.sidebar:
         st.header("⚙️ 분석 설정")
@@ -1284,18 +1854,20 @@ def main():
             "최소 OOS 거래수",
             min_value=2,
             max_value=30,
-            value=3,
+            value=5,
         )
         fee = st.number_input("편도 수수료", 0.0, 0.01, 0.0005, format="%.4f")
         slippage = st.number_input("편도 슬리피지", 0.0, 0.01, 0.0005, format="%.4f")
         spread = st.number_input("스프레드", 0.0, 0.01, 0.0002, format="%.4f")
-        min_signal_score = st.slider("최소 신호 점수", 40.0, 80.0, 50.0, 1.0)
-        neutral_score_gap = st.slider(
-            "LONG/SHORT 중립 간격", 2.0, 20.0, 8.0, 1.0,
-            help="LONG과 SHORT 점수 차이가 이 값보다 작으면 NEUTRAL로 판정합니다.",
-        )
-        use_mtf = st.checkbox("4H 멀티타임프레임 확인", value=True)
-        mc_runs = st.select_slider("Monte Carlo 반복", options=[200, 500, 1000], value=500)
+        st.markdown("### 💰 리스크/포지션 설정")
+        account_size = st.number_input("가정 계좌금액 (USDT)", 100.0, 10_000_000.0, 10_000.0, step=100.0)
+        risk_per_trade = st.number_input("1회 거래 최대위험", 0.001, 0.03, 0.0075, step=0.001, format="%.3f")
+        max_portfolio_risk = st.number_input("전체 포트폴리오 최대위험", 0.005, 0.10, 0.02, step=0.005, format="%.3f")
+        max_position_weight = st.number_input("단일 포지션 최대 비중", 0.05, 1.0, 0.40, step=0.05, format="%.2f")
+        st.markdown("### 🧪 전략 검증")
+        audit_oos = st.button("🧪 최종 OOS 관리전략 검증", use_container_width=True)
+        audit_robust = st.button("🛡️ 관리파라미터 안정성 검증", use_container_width=True)
+        audit_repeat = st.button("🔁 반복 실전 OOS 검증", use_container_width=True)
 
     regime = render_regime()
 
@@ -1315,102 +1887,117 @@ def main():
         return
 
     market = market[market["quote_volume"] >= min_volume].copy()
-    breadth = float((market["change_pct"] > 0).mean() * 100) if len(market) else np.nan
-    st.metric("시장 상승 종목 비율", f"{breadth:.1f}%" if np.isfinite(breadth) else "-")
-    if np.isfinite(breadth):
-        regime["breadth"] = breadth
-        if breadth >= 60:
-            regime["score"] = float(np.clip(regime["score"] + 3, 0, 100))
-        elif breadth <= 40:
-            regime["score"] = float(np.clip(regime["score"] - 3, 0, 100))
-    majors = market[market["base"].isin(TOP_MAJORS)]["symbol"].tolist()
-    others = (
-        market[~market["base"].isin(TOP_MAJORS)]
-        .sort_values("quote_volume", ascending=False)["symbol"]
-        .head(25)
-        .tolist()
+    # Exactly TOP_N liquid USDT pairs are scanned. This prevents the previous
+    # "top 30 + majors" expansion from silently turning into 40+ symbols.
+    TOP_N = 30
+    universe = (
+        market.sort_values("quote_volume", ascending=False)
+        .drop_duplicates("symbol")
+        .head(TOP_N)
     )
+    symbols_top = universe["symbol"].tolist()
 
     c1, c2, c3 = st.columns(3)
     with c1:
         st.metric("분석 가능 종목", len(market))
     with c2:
-        st.metric("메이저", len(majors))
+        st.metric("검토 종목", len(symbols_top))
     with c3:
-        st.metric("후보군", len(others))
+        st.metric("대상", "상위 30 (거래대금)")
 
     cfg = BacktestConfig(
         fee_rate=fee,
         slippage_rate=slippage,
         spread_rate=spread,
         min_oos_trades=int(min_oos_trades),
-        min_signal_score=float(min_signal_score),
-        neutral_score_gap=float(neutral_score_gap),
-        min_direction_score=float(min_signal_score),
-        monte_carlo_runs=int(mc_runs),
-        use_mtf=bool(use_mtf),
+        account_size=float(account_size),
+        risk_per_trade=float(risk_per_trade),
+        max_portfolio_risk=float(max_portfolio_risk),
+        max_position_weight=float(max_position_weight),
     )
 
-    st.subheader("🎯 분석 실행")
-    st.caption("1단계 빠른 스크리닝 → 2단계 WFO 정밀검증 → 최종 후보에만 MTF/파생지표 적용")
+    if audit_oos:
+        audit_symbols = [s for s in symbols_top if s.split("/")[0] in TOP_MAJORS][:5]
+        if not audit_symbols:
+            audit_symbols = symbols_top[:5]
+        with st.spinner("최종 OOS 검증 중... (고정 파라미터 · 미사용 후반 구간)"):
+            audit_df = run_final_oos_audit(audit_symbols, cfg, max_symbols=5)
+        st.session_state["final_oos_audit"] = audit_df
 
+    if audit_repeat:
+        audit_symbols = [s for s in symbols_top if s.split("/")[0] in TOP_MAJORS][:6]
+        if not audit_symbols:
+            audit_symbols = symbols_top[:6]
+        with st.spinner("반복 실전 OOS 검증 중... (고정 파라미터 · 여러 시계열 구간)"):
+            repeat_df = run_repeated_oos_audit(audit_symbols, cfg, max_symbols=6)
+        st.session_state["repeated_oos_audit"] = repeat_df
+
+    if audit_robust:
+        audit_symbols = [s for s in symbols_top if s.split("/")[0] in TOP_MAJORS][:5]
+        if not audit_symbols:
+            audit_symbols = symbols_top[:5]
+        with st.spinner("관리파라미터 안정성 검증 중... (고정된 주변값 · 최종 OOS)"):
+            robust_df = run_final_oos_robustness_audit(audit_symbols, cfg, max_symbols=5)
+        st.session_state["final_oos_robustness"] = robust_df
+
+    repeat_df = st.session_state.get("repeated_oos_audit", pd.DataFrame())
+    if not repeat_df.empty:
+        st.markdown("### 🔁 반복 실전 OOS 검증")
+        st.caption("파라미터를 고정한 상태에서 여러 시계열 OOS 구간을 반복 평가합니다. 어느 구간도 성과가 좋다는 이유로 선택하지 않습니다.")
+        rr = (repeat_df.groupby("profile", as_index=False)
+              .agg(양수구간비율=("positive_slice_ratio", "mean"),
+                   중앙구간수익=("median_slice_return", "mean"),
+                   중앙PF=("median_pf", "mean"),
+                   최악구간=("worst_slice_return", "mean"),
+                   거래수=("total_trades", "sum"), 사례수=("symbol", "count"),
+                   안정성=("stability", "mean")))
+        rr["중앙구간수익"] *= 100; rr["최악구간"] *= 100
+        st.dataframe(rr.round({"양수구간비율":1,"중앙구간수익":2,"중앙PF":2,"최악구간":2,"거래수":0,"사례수":0,"안정성":1}), use_container_width=True, hide_index=True)
+        st.caption("안정성 점수는 확률이나 예측치가 아닙니다. 여러 미사용 구간에서 BASE가 얼마나 일관되게 작동했는지를 요약한 진단값입니다.")
+
+    robust_df = st.session_state.get("final_oos_robustness", pd.DataFrame())
+    if not robust_df.empty:
+        st.markdown("### 🛡️ 최종 OOS 관리파라미터 안정성")
+        st.caption("최종 OOS에서 고정된 보수/기본/공격 관리설정의 주변값을 비교합니다. 특정 설정의 최고값을 자동 채택하지 않습니다.")
+        rs=(robust_df.groupby("profile",as_index=False)
+            .agg(Return=("return","mean"), PF=("pf","mean"), MDD=("mdd","mean"), Win=("win_rate","mean"), Trades=("trades","sum"), Cases=("symbol","count")))
+        rs["Return"]*=100; rs["MDD"]*=100
+        st.dataframe(rs.round({"Return":2,"PF":2,"MDD":2,"Win":1,"Trades":0,"Cases":0}),use_container_width=True,hide_index=True)
+        st.caption("안정성 검증의 목적은 파라미터 봉우리가 지나치게 뾰족한지 확인하는 것입니다. 표본이 적으면 결론을 확정하지 않습니다.")
+
+    audit_df = st.session_state.get("final_oos_audit", pd.DataFrame())
+    if not audit_df.empty:
+        st.markdown("### 🧪 최종 OOS 관리전략 검증")
+        st.caption("마지막 25% 구간은 파라미터 선택에 사용하지 않은 최종 검증 구간입니다. 결과는 전략 선택을 자동 변경하지 않습니다.")
+        summary = (audit_df.groupby("variant", as_index=False)
+                   .agg(Return=("return", "mean"), Win=("win_rate", "mean"),
+                        PF=("profit_factor", "mean"), MDD=("mdd", "mean"), Trades=("trades", "sum")))
+        summary["Return"] *= 100; summary["MDD"] *= 100
+        st.dataframe(summary.round({"Return":2,"Win":1,"PF":2,"MDD":2,"Trades":0}),
+                     use_container_width=True, hide_index=True)
+        st.caption("BASE/BE_ONLY/BE_TRAIL/FULL은 사전에 고정된 관리규칙 비교입니다. 표본이 작으면 우열을 단정하지 않습니다.")
+
+    st.subheader("🎯 분석 실행")
+
+    # Mobile-friendly buttons
     quick = st.button("⚡ 빠른 분석 — 메이저 + 상위 10", use_container_width=True)
-    full = st.button("🔬 정밀 분석 — 상위 25 + 메이저", use_container_width=True)
+    full = st.button("🔬 정밀 분석 — 거래대금 상위 30", use_container_width=True)
 
     if quick or full:
-        symbols = list(dict.fromkeys(majors + others[:10])) if quick else list(dict.fromkeys(majors + others))
-        screen_floor = max(40.0, float(min_signal_score) - 12.0)
-        with st.spinner(f"1단계: {len(symbols)}개 종목 빠른 스크리닝 중..."):
-            screened = []
-            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-                fs = [pool.submit(fast_screen, s, regime, screen_floor) for s in symbols]
-                for f in concurrent.futures.as_completed(fs):
-                    try:
-                        r = f.result()
-                        if r:
-                            screened.append(r)
-                    except Exception:
-                        pass
-            screened = sorted(screened, key=lambda x: x["screen_score"], reverse=True)
-
-        # Never run expensive WFO on the entire universe. Keep a meaningful
-        # candidate pool so a weak market can still return NEUTRAL diagnostics.
-        max_candidates = 12 if quick else 18
-        candidate_symbols = [x["symbol"] for x in screened[:max_candidates]]
-        st.info(f"1단계 통과 {len(screened)}개 → 2단계 정밀검증 {len(candidate_symbols)}개")
-
-        if candidate_symbols:
-            # Fast mode deliberately disables expensive live enrichment.
-            # Full mode enriches only the already screened candidates.
-            cfg_run = BacktestConfig(
-                fee_rate=cfg.fee_rate, slippage_rate=cfg.slippage_rate, spread_rate=cfg.spread_rate,
-                max_holding_bars=cfg.max_holding_bars, min_oos_trades=cfg.min_oos_trades,
-                atr_window=cfg.atr_window, train_bars=cfg.train_bars, test_bars=cfg.test_bars,
-                step_bars=cfg.step_bars, min_train_trades=cfg.min_train_trades,
-                min_signal_score=cfg.min_signal_score, monte_carlo_runs=(200 if quick else cfg.monte_carlo_runs),
-                use_mtf=(cfg.use_mtf if full else False), neutral_score_gap=cfg.neutral_score_gap,
-                min_direction_score=cfg.min_direction_score, data_limit=cfg.data_limit
-            )
-            with st.spinner(f"2단계: {len(candidate_symbols)}개 종목 WFO 정밀검증 중..."):
-                result = run_parallel(candidate_symbols, cfg_run, workers=6, market_regime=regime, enrich=not quick)
-        else:
-            result = pd.DataFrame()
-
+        symbols = symbols_top[:10] if quick else symbols_top
+        with st.spinner(f"{len(symbols)}개 종목 분석 중... (시장레짐 → 추세/역추세 → Entry/TP/SL)"):
+            result = run_parallel(symbols, cfg, workers=6)
         st.session_state["quant_results"] = result
-        st.session_state["quant_screened"] = len(screened)
         st.session_state["quant_time"] = pd.Timestamp.now(tz="UTC")
 
     result = st.session_state.get("quant_results", pd.DataFrame())
 
     if not result.empty:
-        st.success(f"분석 완료 · {len(result)}개 결과")
+        passed = result[result["direction"].isin(["LONG", "SHORT"])].copy()
+        waits = result[result["direction"] == "WAIT"].copy()
+        st.success(f"분석 완료 · {len(result)}개 결과 · 실행신호 {len(passed)}개 · WAIT {len(waits)}개")
+        render_portfolio_candidates(result)
         render_results(result)
-    elif st.session_state.get("quant_screened") is not None:
-        st.warning(
-            f"정밀검증 결과 방향성 후보가 없습니다. 1단계 스크리닝 통과 종목: "
-            f"{st.session_state.get('quant_screened', 0)}개. "
-            "시장 방향성이 약하거나 OOS 거래수가 부족한 경우 정상적으로 발생할 수 있습니다."
-        )
 
         st.markdown("### 📈 점수 분포")
         fig = go.Figure()
@@ -1434,7 +2021,7 @@ def main():
         )
 
     st.divider()
-    st.caption("Data source: CCXT-supported exchanges · Analysis is informational, not financial advice.")
+    st.caption("확정봉 · 1D 주 분석 → 상위 후보만 1D/4H/1H MTF 정밀검증 · 구조적 단일 TP/SL · OOS 검증은 참고층 · Data source: CCXT-supported exchanges · Analysis is informational, not financial advice.")
 
 
 if __name__ == "__main__":
