@@ -65,6 +65,14 @@ class BacktestConfig:
     risk_per_trade: float = 0.0075
     max_portfolio_risk: float = 0.02
     max_position_weight: float = 0.40
+    # Extreme-volatility execution controls. These are risk gates, not signal
+    # predictors: a historically good WFO result cannot override a current
+    # market state that is too unstable for the configured execution model.
+    extreme_atr_pct: float = 10.0
+    extreme_vol_30d_pct: float = 160.0
+    extreme_daily_shock_pct: float = 18.0
+    high_atr_pct: float = 6.0
+    high_vol_30d_pct: float = 100.0
 
 
 # ============================================================
@@ -1108,10 +1116,12 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig, use_mtf: bool = True) -> Op
 
         daily_ret = df["Close"].pct_change().dropna().tail(30)
         vol_30d_pct = float(daily_ret.std(ddof=1) * math.sqrt(30) * 100) if len(daily_ret) >= 10 else np.nan
+        daily_shock_pct = float(abs(daily_ret.iloc[-1]) * 100) if len(daily_ret) else np.nan
         return {
             "symbol": symbol, "exchange": exchange_id, "price": float(latest["Close"]),
             "change_30d": float((latest["Close"] / df["Close"].iloc[-31] - 1) * 100),
             "vol_30d_pct": vol_30d_pct,
+            "daily_shock_pct": daily_shock_pct,
             "direction": status, "signal_direction": best_sig["direction"],
             "score": float(best_sig["score"]), "signal": best_sig,
             "wf": empty_metrics(), "rsi": float(latest["RSI14"]), "adx": float(latest["ADX14"]),
@@ -1252,13 +1262,12 @@ def _cross_sectional_percentile(values: list[float], value: float) -> float:
 
 
 def add_market_opportunity_score(rows: list[dict]) -> None:
-    """Score profit opportunity from liquidity, productive volatility and trend quality.
+    """Score *risk-adjusted* profit opportunity from current market evidence.
 
-    This is a ranking overlay, not a probability. Liquidity uses cross-sectional
-    quote-volume percentile; volatility favors a usable high-volatility zone and
-    penalizes extreme ATR%; ADX measures directional trend strength. R:R and the
-    empirical OOS TP-before-SL estimate are included so raw volatility cannot
-    dominate the final decision.
+    Volatility is treated as a two-sided variable: usable volatility can improve
+    opportunity, but extreme ATR/realized-volatility/shock conditions are
+    explicitly penalized. WFO/OOS is a validation input, never a waiver for
+    current execution risk.
     """
     if not rows:
         return
@@ -1267,57 +1276,141 @@ def add_market_opportunity_score(rows: list[dict]) -> None:
     log_volumes = [math.log10(max(v, 1.0)) if np.isfinite(v) and v > 0 else np.nan for v in volumes]
     atr_values = [float(r.get("atr_pct", np.nan)) for r in rows]
     vol_30d_values = [float(r.get("vol_30d_pct", np.nan)) for r in rows]
+    shock_values = [float(r.get("daily_shock_pct", np.nan)) for r in rows]
 
     finite_atr = np.asarray([x for x in atr_values if np.isfinite(x) and x > 0], dtype=float)
     median_atr = float(np.median(finite_atr)) if finite_atr.size else 2.0
-    target_atr = float(np.clip(median_atr * 1.8, 2.0, 5.0))
+    target_atr = float(np.clip(median_atr * 1.6, 2.0, 4.5))
 
-    for r, log_vol, atr, vol_30d in zip(rows, log_volumes, atr_values, vol_30d_values):
+    # A percentile of 98+ means the coin is an extreme outlier in the currently
+    # scanned universe. It is used as a warning/risk input, not as a prediction.
+    for r, log_vol, atr, vol_30d, shock in zip(rows, log_volumes, atr_values, vol_30d_values, shock_values):
         sig = r.get("signal", {}) or {}
         adx = float(r.get("adx", sig.get("adx", 0.0)))
         rr = float(sig.get("rr", 0.0))
 
         liquidity = _cross_sectional_percentile(log_volumes, log_vol)
+        vol_30d_pctile = _cross_sectional_percentile(vol_30d_values, vol_30d)
+        shock_pctile = _cross_sectional_percentile(shock_values, shock)
 
         if np.isfinite(atr) and atr > 0:
-            # Log-distance keeps the score symmetric for low/high volatility.
-            volatility = 100.0 * math.exp(-abs(math.log(max(atr, 0.25) / target_atr)) / 1.10)
-            # Extreme ATR can be profitable but usually comes with worse execution
-            # conditions, so reduce only the tail rather than hard-filtering it.
-            if atr > 8.0:
-                volatility *= max(0.55, 1.0 - (atr - 8.0) * 0.06)
+            # Bell-shaped preference: useful volatility is rewarded, extremes are
+            # penalized increasingly rather than being treated as "more profit".
+            volatility = 100.0 * math.exp(-abs(math.log(max(atr, 0.25) / target_atr)) / 0.95)
+            if atr > 6.0:
+                volatility *= max(0.25, 1.0 - (atr - 6.0) * 0.10)
+            if atr >= 10.0:
+                volatility *= 0.20
             elif atr < 0.8:
-                volatility *= 0.65
+                volatility *= 0.55
         else:
             volatility = 0.0
 
-        vol_30d_score = _cross_sectional_percentile(vol_30d_values, vol_30d)
+        # 30D volatility is no longer a pure percentile bonus. The high tail is
+        # progressively discounted because extreme dispersion increases stop and
+        # execution uncertainty.
+        if np.isfinite(vol_30d):
+            vol30_quality = float(np.clip(vol_30d_pctile, 0.0, 100.0))
+            if vol_30d > 100.0:
+                vol30_quality *= max(0.35, 1.0 - (vol_30d - 100.0) * 0.004)
+            if vol_30d > 160.0:
+                vol30_quality *= 0.35
+        else:
+            vol30_quality = 0.0
+
         adx_score = float(np.clip((adx - 15.0) / 20.0 * 100.0, 0.0, 100.0))
         rr_score = float(np.clip(50.0 + (rr - 1.0) * 35.0, 0.0, 100.0))
+
         oos_prob = float(r.get("oos_est_win_rate", np.nan))
         oos_conf = float(r.get("oos_confidence", 0.0))
         oos_score = 50.0 + (oos_prob - 50.0) * (oos_conf / 100.0) if np.isfinite(oos_prob) else 50.0
 
-        # Profit-opportunity blend: liquidity + 30D realized volatility are the
-        # primary universe-selection signals, while ATR/ADX/R:R/OOS keep the
-        # ranking tied to tradability and actual setup quality.
+        # Empirical expected value in R. This is a diagnostic/ranking feature,
+        # not a promise of future profit. Costs are normalized by stop distance.
+        stop_pct = abs(float(sig.get("entry", r.get("price", np.nan))) - float(sig.get("sl", np.nan))) / max(float(sig.get("entry", r.get("price", 1.0))), 1e-12)
+        if np.isfinite(stop_pct) and stop_pct > 0 and np.isfinite(oos_prob):
+            p = np.clip(oos_prob / 100.0, 0.0, 1.0)
+            cost_r = (2.0 * (0.0005 + 0.0005 + 0.0002)) / stop_pct
+            ev_r = p * rr - (1.0 - p) - cost_r
+            ev_score = float(np.clip(50.0 + ev_r * 28.0, 0.0, 100.0))
+        else:
+            ev_r = np.nan
+            ev_score = 50.0
+
+        # Current-execution risk: extreme volatility is a hard exclusion; high
+        # volatility is a penalty. This prevents WFO from overriding current risk.
+        extreme = (
+            (np.isfinite(atr) and atr >= 10.0)
+            or (np.isfinite(vol_30d) and vol_30d >= 160.0)
+            or (np.isfinite(shock) and shock >= 18.0)
+            or (vol_30d_pctile >= 98.0 and np.isfinite(atr) and atr >= 6.0)
+        )
+        high_vol = (
+            (np.isfinite(atr) and atr >= 6.0)
+            or (np.isfinite(vol_30d) and vol_30d >= 100.0)
+            or (shock_pctile >= 95.0)
+        )
+        if extreme:
+            execution_risk = "EXTREME"
+            execution_risk_score = 100.0
+            risk_multiplier = 0.0
+        elif high_vol:
+            execution_risk = "HIGH"
+            execution_risk_score = 70.0
+            risk_multiplier = 0.75
+        else:
+            execution_risk = "NORMAL"
+            execution_risk_score = 25.0
+            risk_multiplier = 1.0
+
         opportunity = (
             0.20 * liquidity
-            + 0.20 * vol_30d_score
+            + 0.15 * vol30_quality
             + 0.10 * volatility
             + 0.15 * adx_score
             + 0.15 * rr_score
-            + 0.20 * oos_score
+            + 0.15 * oos_score
+            + 0.10 * ev_score
         )
+        opportunity *= risk_multiplier
 
         r["liquidity_score"] = float(np.clip(liquidity, 0.0, 100.0))
         r["volatility_score"] = float(np.clip(volatility, 0.0, 100.0))
-        r["vol_30d_score"] = float(np.clip(vol_30d_score, 0.0, 100.0))
+        r["vol_30d_score"] = float(np.clip(vol30_quality, 0.0, 100.0))
+        r["vol_30d_percentile"] = float(np.clip(vol_30d_pctile, 0.0, 100.0))
+        r["shock_percentile"] = float(np.clip(shock_pctile, 0.0, 100.0))
         r["adx_score"] = float(np.clip(adx_score, 0.0, 100.0))
         r["rr_score"] = float(np.clip(rr_score, 0.0, 100.0))
         r["oos_opportunity_score"] = float(np.clip(oos_score, 0.0, 100.0))
+        r["ev_r"] = float(ev_r) if np.isfinite(ev_r) else np.nan
+        r["ev_score"] = float(ev_score)
+        r["execution_risk"] = execution_risk
+        r["execution_risk_score"] = execution_risk_score
+        r["extreme_volatility_block"] = bool(extreme)
+        r["risk_multiplier"] = risk_multiplier
         r["opportunity_score"] = float(np.clip(opportunity, 0.0, 100.0))
         r["atr_target_pct"] = target_atr
+
+
+def apply_volatility_execution_gate(rows: list[dict]) -> None:
+    """Convert extreme current volatility into WAIT before portfolio selection."""
+    for r in rows:
+        if not r.get("extreme_volatility_block", False):
+            continue
+        if r.get("direction") in {"LONG", "SHORT"}:
+            risk_bits = []
+            atr = float(r.get("atr_pct", np.nan))
+            vol30 = float(r.get("vol_30d_pct", np.nan))
+            shock = float(r.get("daily_shock_pct", np.nan))
+            if np.isfinite(atr) and atr >= 10.0:
+                risk_bits.append(f"ATR {atr:.1f}%")
+            if np.isfinite(vol30) and vol30 >= 160.0:
+                risk_bits.append(f"1M변동성 {vol30:.0f}%")
+            if np.isfinite(shock) and shock >= 18.0:
+                risk_bits.append(f"일변동 {shock:.1f}%")
+            r["direction"] = "WAIT"
+            r["status_pass"] = False
+            r["reason"] = "극단적 변동성으로 실행 차단" + (f" ({', '.join(risk_bits)})" if risk_bits else "") + " · WFO 결과와 무관하게 현재 리스크 우선"
 
 
 def execution_priority_score(row: dict) -> float:
@@ -1358,6 +1451,7 @@ def add_execution_priority(rows: list[dict]) -> None:
     # Cross-sectional liquidity/volatility scoring must happen after OOS values
     # exist and before the final execution-priority rank is calculated.
     add_market_opportunity_score(rows)
+    apply_volatility_execution_gate(rows)
 
     for r in rows:
         r["execution_priority"] = execution_priority_score(r)
@@ -1717,6 +1811,8 @@ def render_mobile_card(row: pd.Series):
                 f"유동성 {float(row.get('liquidity_score', 0.0)):.0f} · "
                 f"1M변동성 {float(row.get('vol_30d_pct', np.nan)):.1f}% · "
                 f"변동성 {float(row.get('volatility_score', 0.0)):.0f} · "
+                f"실행위험 {row.get('execution_risk', '-')} · "
+                f"EV {float(row.get('ev_r', np.nan)):.2f}R · "
                 f"ADX {float(row.get('adx_score', 0.0)):.0f} · "
                 f"24H 거래대금 {float(row.get('quote_volume', np.nan))/1_000_000:.1f}M USDT"
             )
@@ -1738,53 +1834,32 @@ def render_portfolio_candidates(df: pd.DataFrame):
         return
 
     selected = selected.sort_values("portfolio_rank")
-    st.markdown("### 🚀 지금 실행할 후보")
-    st.caption("한 줄 요약은 즉시 매매 판단용이며, 상세 수치와 근거는 각 후보의 '상세보기'에서 확인할 수 있습니다.")
+    st.markdown("### 🎯 추천 코인")
+    st.caption("LONG과 SHORT 추천을 각각 한 줄로 표시합니다. 상세 수치와 포지션 정보는 아래 전체 분석 결과에서 확인할 수 있습니다.")
 
-    for _, row in selected.iterrows():
-        sig = row["signal"]
-        icon = "🟢" if row["direction"] == "LONG" else "🔴"
-        pos = row.get("position_notional", np.nan)
-        risk = row.get("risk_used", np.nan)
-        pos_txt = f"{pos:,.0f} USDT" if np.isfinite(pos) else "-"
-        risk_txt = f"{risk:,.2f} USDT" if np.isfinite(risk) else "-"
-        prio = float(row.get("execution_priority", row.get("score", 0.0)))
-        opp = float(row.get("opportunity_score", 0.0))
-        oos_p = row.get("oos_est_win_rate", np.nan)
-        oos_c = float(row.get("oos_confidence", 0.0))
-        oos_txt = f"OOS {oos_p:.1f}%/{oos_c:.0f}" if np.isfinite(oos_p) else "OOS -"
-
-        with st.container(border=True):
-            # Same compact one-line format as the market/result cards.
-            st.markdown(
-                f"**{icon} #{int(row['portfolio_rank'])} {row['symbol']} {row['direction']}** · "
-                f"우선순위 **{prio:.0f}** · 수익기회 **{opp:.0f}** · "
-                f"R:R **1:{sig['rr']:.2f}** · MTF **{sig['mtf_score']:.0f}** · "
-                f"ENTRY **{fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])}** · "
-                f"SL **{fmt_price(sig['sl'])}** · TP **{fmt_price(sig['tp'])}**"
+    def _line(direction: str) -> str:
+        rows = selected[selected["direction"] == direction]
+        icon = "🟢" if direction == "LONG" else "🔴"
+        if rows.empty:
+            return f"**{icon} {direction}** · 추천 없음"
+        parts = []
+        for _, row in rows.iterrows():
+            sig = row["signal"]
+            prio = float(row.get("execution_priority", row.get("score", 0.0)))
+            opp = float(row.get("opportunity_score", 0.0))
+            risk = str(row.get("execution_risk", "NORMAL"))
+            ev = row.get("ev_r", np.nan)
+            ev_txt = f"EV {ev:.2f}R" if np.isfinite(ev) else "EV -"
+            parts.append(
+                f"**{row['symbol']}** · 우선순위 {prio:.0f} · 수익기회 {opp:.0f} · "
+                f"{ev_txt} · 위험 {risk} · R:R 1:{sig['rr']:.2f} · "
+                f"ENTRY {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} · "
+                f"SL {fmt_price(sig['sl'])} · TP {fmt_price(sig['tp'])}"
             )
-            with st.expander("상세보기", expanded=False):
-                a, b, c, d = st.columns(4)
-                a.metric("실전 우선순위", f"{prio:.0f}")
-                b.metric("수익기회", f"{opp:.0f}")
-                c.metric("QUANT", f"{row['score']:.0f}")
-                d.metric("R:R", f"1 : {sig['rr']:.2f}")
-                a, b, c = st.columns(3)
-                a.metric("ENTRY", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
-                b.metric("🔴 SL", fmt_price(sig["sl"]))
-                c.metric("🎯 TP", fmt_price(sig["tp"]))
-                a, b, c = st.columns(3)
-                a.metric("포지션", pos_txt)
-                b.metric("SL 위험", risk_txt)
-                c.metric("전략", sig["strategy"])
-                st.caption(
-                    f"시장상태 {sig['market_state']} · {oos_txt} · "
-                    f"유동성 {float(row.get('liquidity_score', 0.0)):.0f} · "
-                    f"변동성 {float(row.get('volatility_score', 0.0)):.0f} · "
-                    f"ADX {float(row.get('adx_score', 0.0)):.0f} · "
-                    f"24H 거래대금 {float(row.get('quote_volume', np.nan))/1_000_000:.1f}M USDT"
-                )
-                st.caption(f"전략 {sig['strategy']} · 시장상태 {sig['market_state']} · {row.get('portfolio_reason', '')}")
+        return f"**{icon} {direction}** · " + "  |  ".join(parts)
+
+    st.markdown(_line("LONG"))
+    st.markdown(_line("SHORT"))
 
 
 def render_results(df: pd.DataFrame):
@@ -1800,6 +1875,9 @@ def render_results(df: pd.DataFrame):
         display["변동성"] = display["volatility_score"].round(0) if "volatility_score" in display else np.nan
         display["1M변동성"] = display["vol_30d_pct"].round(2) if "vol_30d_pct" in display else np.nan
         display["ADX"] = display["adx_score"].round(0) if "adx_score" in display else np.nan
+        display["EV_R"] = display["ev_r"].round(2) if "ev_r" in display else np.nan
+        display["실행위험"] = display["execution_risk"] if "execution_risk" in display else "-"
+        display["변동성차단"] = display["extreme_volatility_block"] if "extreme_volatility_block" in display else False
         display["score"] = display["score"].round(1)
         display["price"] = display["price"].map(fmt_price)
         display["30D"] = display["change_30d"].round(2)
@@ -1819,11 +1897,11 @@ def render_results(df: pd.DataFrame):
         display["SL위험"] = display["risk_used"].round(0) if "risk_used" in display else np.nan
         display["Status"] = display["direction"]
         display["판정사유"] = display["reason"]
-        cols = ["symbol", "Status", "포트폴리오", "우선순위", "수익기회", "유동성", "1M변동성", "변동성", "ADX", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
+        cols = ["symbol", "Status", "포트폴리오", "우선순위", "수익기회", "EV_R", "실행위험", "변동성차단", "유동성", "1M변동성", "변동성", "ADX", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
         st.dataframe(display[cols], use_container_width=True, hide_index=True, column_config={
             "symbol":"종목", "Status":"최종판정", "포트폴리오":"실행순위", "우선순위":"실전 우선순위",
             "score":"QUANT", "price":"현재가", "RR":"R:R", "MTF":"MTF", "OOS추정승률":"OOS 추정 승률%", "OOS신뢰도":"OOS 신뢰도", "WFO":"WFO 견고성",
-            "수익기회":"수익기회 점수", "유동성":"유동성", "1M변동성":"1개월 실현변동성%", "변동성":"단기 변동성", "ADX":"ADX",
+            "수익기회":"수익기회 점수", "EV_R":"기대값(R)", "실행위험":"현재 실행위험", "변동성차단":"극단변동성 차단", "유동성":"유동성", "1M변동성":"1개월 실현변동성%", "변동성":"단기 변동성", "ADX":"ADX",
             "OOS":"OOS%", "Win":"OOS 승률%", "PF":"PF", "MDD":"MDD%", "Trades":"거래수",
             "포지션":"권장 포지션(USDT)", "SL위험":"SL 위험금액", "판정사유":"판정사유",
         })
