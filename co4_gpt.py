@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V4
+Crypto Quant Dashboard V4 (Final Fixed Version)
+- Multi-Exchange Fallback Support (Binance, Bybit, Mexc, Gateio)
 - UI & Data separation: [🔥 Trend Following / Aggressive] vs [🛡️ Defensive/Reversal]
 - Dynamic Regime-Aware ATR TP Extension (4.0 ~ 6.0x for Trends)
 - Funding Rate & Orderbook Slip Cost Integration
 - Logistic Regression / Ensemble Weight Optimization
-- Hierarchical Multi-Timeframe (MTF) Filtering (1D major trend + 1H/4H pullback)
+- Hierarchical Multi-Timeframe (MTF) Filtering
 """
 
 from __future__ import annotations
@@ -52,7 +53,7 @@ class BacktestConfig:
 
 
 # ============================================================
-# 1. DATA ACCESS & FUNDING RATE
+# 1. DATA ACCESS & MULTI-EXCHANGE FALLBACK
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -66,26 +67,34 @@ def make_exchange(exchange_id: str):
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_tickers(exchange_id: str) -> pd.DataFrame:
-    ex = make_exchange(exchange_id)
-    tickers = ex.fetch_tickers()
-    rows = []
-    for symbol, t in tickers.items():
-        if not symbol.endswith("/USDT"):
+def fetch_tickers_with_fallback() -> tuple[pd.DataFrame, str]:
+    """바이낸스 IP 제한 및 접속 장애 시 Bybit, Mexc 등으로 자동 전환하는 Fallback 로직"""
+    for exchange_id in DEFAULT_EXCHANGES:
+        try:
+            ex = make_exchange(exchange_id)
+            tickers = ex.fetch_tickers()
+            rows = []
+            for symbol, t in tickers.items():
+                if not symbol.endswith("/USDT"):
+                    continue
+                last = t.get("last")
+                quote_volume = t.get("quoteVolume")
+                pct = t.get("percentage")
+                if last is None:
+                    continue
+                rows.append({
+                    "symbol": symbol,
+                    "base": symbol.split("/")[0],
+                    "last": float(last),
+                    "change_pct": float(pct) if pct is not None else np.nan,
+                    "quote_volume": float(quote_volume) if quote_volume is not None else 0.0,
+                })
+            df = pd.DataFrame(rows)
+            if not df.empty:
+                return df, exchange_id
+        except Exception:
             continue
-        last = t.get("last")
-        quote_volume = t.get("quoteVolume")
-        pct = t.get("percentage")
-        if last is None:
-            continue
-        rows.append({
-            "symbol": symbol,
-            "base": symbol.split("/")[0],
-            "last": float(last),
-            "change_pct": float(pct) if pct is not None else np.nan,
-            "quote_volume": float(quote_volume) if quote_volume is not None else 0.0,
-        })
-    return pd.DataFrame(rows)
+    return pd.DataFrame(), ""
 
 
 @st.cache_data(ttl=30, show_spinner=False)
@@ -254,7 +263,6 @@ def classify_market_state(df: pd.DataFrame) -> dict:
 
 def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
                       atr: float, strategy: str, market_state: str) -> dict:
-    # 공격적 추세장(TREND)에서는 4.0~6.0 ATR 확장, 방어형(REVERSAL/RANGE)에서는 1.5~2.5 ATR 적용
     if market_state in {"TREND_UP", "TREND_DOWN"} and strategy == "TREND":
         atr_mults = [3.0, 4.0, 5.0, 6.0]
     else:
@@ -264,11 +272,6 @@ def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
     best_tp = entry + atr_mults[-1] * atr if direction == "LONG" else entry - atr_mults[-1] * atr
     best_rr = abs(best_tp - entry) / max(risk, 1e-12)
     return {"tp": float(best_tp), "rr": float(best_rr), "tp_source": "dynamic_atr"}
-
-
-def execution_cost(cfg: BacktestConfig, funding_rate: float) -> float:
-    funding_penalty = abs(funding_rate) * 3.0 if funding_rate != 0 else 0.0001
-    return 2 * (cfg.fee_rate + cfg.slippage_rate + cfg.spread_rate / 2) + funding_penalty
 
 
 # ============================================================
@@ -283,7 +286,6 @@ def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) 
     state = classify_market_state(df)
     mtf_score, _ = mtf_direction_score(mtf, direction)
 
-    # ML 앙상블 점수 산출
     score = (r["ADX14"] * 0.4) + (mtf_score * 0.4) + (20 if strategy == "TREND" else 10)
     score = float(np.clip(score, 0, 100))
 
@@ -316,7 +318,6 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
         mtf = fetch_mtf_context(symbol)
         state = classify_market_state(df)
 
-        # 전략 분기: 추세장이면 공격형(TREND), 아니면 방어형(REVERSAL/RANGE)
         strategy = "TREND" if state["state"] in {"TREND_UP", "TREND_DOWN"} else "REVERSAL"
         direction = "LONG" if state["state"] in {"TREND_UP", "EXHAUSTION_DOWN"} else "SHORT"
         
@@ -324,7 +325,6 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
         if not sig:
             return None
 
-        # 모드 분리 태그 부여: 공격형(Aggressive Trend) vs 방어형(Defensive Hunter)
         mode_type = "AGGRESSIVE" if strategy == "TREND" and sig["rr"] >= 2.5 else "DEFENSIVE"
 
         return {
@@ -350,10 +350,13 @@ def main():
         min_volume = st.number_input("최소 거래대금 (USDT)", 100_000.0, 50_000_000.0, 1_000_000.0, 100_000.0)
         account_size = st.number_input("계좌 금액 (USDT)", 100.0, 10_000_000.0, 10_000.0, 100.0)
 
-    market = fetch_tickers("binance")
+    # Fallback 적용된 거래소 데이터 연동
+    market, active_exchange = fetch_tickers_with_fallback()
     if market.empty:
-        st.error("거래소 시세를 불러오지 못했습니다.")
+        st.error("모든 지원 거래소에서 시세를 불러오지 못했습니다. 네트워크 상태를 확인해주세요.")
         return
+    else:
+        st.caption(f"데이터 연동 성공 거래소: **{active_exchange.upper()}**")
 
     universe = market[market["quote_volume"] >= min_volume].sort_values("quote_volume", ascending=False).head(20)
     symbols = universe["symbol"].tolist()
@@ -371,7 +374,6 @@ def main():
     if results:
         df_res = pd.DataFrame(results)
         
-        # UI 탭 분리 구현
         tab1, tab2 = st.tabs(["🔥 [공격형] 대세 추종 알파 모드 (High RR)", "🛡️ [방어형] 숏컷 헌터 모드 (High Win-Rate)"])
 
         with tab1:
