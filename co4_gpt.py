@@ -1240,48 +1240,118 @@ def oos_calibrated_win_rate(row: dict) -> tuple[float, float, int]:
     return float(np.clip(p * 100.0, 0.0, 100.0)), float(np.clip(confidence, 0.0, 100.0)), trades
 
 
-def execution_priority_score(row: dict) -> float:
-    """Rank live candidates using market evidence plus OOS reliability.
+def _cross_sectional_percentile(values: list[float], value: float) -> float:
+    """Percentile rank within the currently scanned universe (0-100)."""
+    arr = np.asarray([v for v in values if np.isfinite(v)], dtype=float)
+    if arr.size < 2 or not np.isfinite(value):
+        return 50.0
+    return float(np.clip((np.sum(arr <= value) - 1) / (arr.size - 1) * 100.0, 0.0, 100.0))
 
-    The result is an execution-priority index, NOT a probability. OOS evidence
-    is deliberately capped so a small historical sample cannot overpower the
-    current-market signal.
+
+def add_market_opportunity_score(rows: list[dict]) -> None:
+    """Score profit opportunity from liquidity, productive volatility and trend quality.
+
+    This is a ranking overlay, not a probability. Liquidity uses cross-sectional
+    quote-volume percentile; volatility favors a usable high-volatility zone and
+    penalizes extreme ATR%; ADX measures directional trend strength. R:R and the
+    empirical OOS TP-before-SL estimate are included so raw volatility cannot
+    dominate the final decision.
+    """
+    if not rows:
+        return
+
+    volumes = [float(r.get("quote_volume", np.nan)) for r in rows]
+    log_volumes = [math.log10(max(v, 1.0)) if np.isfinite(v) and v > 0 else np.nan for v in volumes]
+    atr_values = [float(r.get("atr_pct", np.nan)) for r in rows]
+
+    finite_atr = np.asarray([x for x in atr_values if np.isfinite(x) and x > 0], dtype=float)
+    median_atr = float(np.median(finite_atr)) if finite_atr.size else 2.0
+    # Adaptive sweet spot: high enough to create room for TP, but not the most
+    # extreme contracts in the universe. Keep it in a practical 2-5% ATR band.
+    target_atr = float(np.clip(median_atr * 1.8, 2.0, 5.0))
+
+    for r, log_vol, atr in zip(rows, log_volumes, atr_values):
+        sig = r.get("signal", {}) or {}
+        adx = float(r.get("adx", sig.get("adx", 0.0)))
+        rr = float(sig.get("rr", 0.0))
+
+        liquidity = _cross_sectional_percentile(log_volumes, log_vol)
+
+        if np.isfinite(atr) and atr > 0:
+            # Log-distance keeps the score symmetric for low/high volatility.
+            volatility = 100.0 * math.exp(-abs(math.log(max(atr, 0.25) / target_atr)) / 1.10)
+            # Extreme ATR can be profitable but usually comes with worse execution
+            # conditions, so reduce only the tail rather than hard-filtering it.
+            if atr > 8.0:
+                volatility *= max(0.55, 1.0 - (atr - 8.0) * 0.06)
+            elif atr < 0.8:
+                volatility *= 0.65
+        else:
+            volatility = 0.0
+
+        adx_score = float(np.clip((adx - 15.0) / 20.0 * 100.0, 0.0, 100.0))
+        rr_score = float(np.clip(50.0 + (rr - 1.0) * 35.0, 0.0, 100.0))
+        oos_prob = float(r.get("oos_est_win_rate", np.nan))
+        oos_conf = float(r.get("oos_confidence", 0.0))
+        oos_score = 50.0 + (oos_prob - 50.0) * (oos_conf / 100.0) if np.isfinite(oos_prob) else 50.0
+
+        opportunity = (
+            0.22 * liquidity
+            + 0.25 * volatility
+            + 0.18 * adx_score
+            + 0.15 * rr_score
+            + 0.20 * oos_score
+        )
+
+        r["liquidity_score"] = float(np.clip(liquidity, 0.0, 100.0))
+        r["volatility_score"] = float(np.clip(volatility, 0.0, 100.0))
+        r["adx_score"] = float(np.clip(adx_score, 0.0, 100.0))
+        r["rr_score"] = float(np.clip(rr_score, 0.0, 100.0))
+        r["oos_opportunity_score"] = float(np.clip(oos_score, 0.0, 100.0))
+        r["opportunity_score"] = float(np.clip(opportunity, 0.0, 100.0))
+        r["atr_target_pct"] = target_atr
+
+
+def execution_priority_score(row: dict) -> float:
+    """Rank live candidates using signal quality plus profit-opportunity evidence.
+
+    The result is an execution-priority index, NOT a probability. The opportunity
+    overlay is capped so liquidity/volatility cannot overpower a weak trade setup.
     """
     sig = row.get("signal", {}) or {}
     base = float(row.get("score", 0.0))
     gap = float(row.get("score_gap", 0.0))
     mtf = float(sig.get("mtf_score", 0.0))
-    rr = float(sig.get("rr", 0.0))
     strategy = sig.get("strategy", "TREND")
     reversal = float(sig.get("reversal_score", 0.0))
+    opportunity = float(row.get("opportunity_score", 50.0))
 
     gap_component = float(np.clip(50.0 + gap * 3.0, 0.0, 100.0))
     mtf_component = float(np.clip(mtf, 0.0, 100.0))
-    rr_component = float(np.clip(50.0 + (rr - 1.0) * 35.0, 0.0, 100.0))
     rev_component = float(np.clip(reversal, 0.0, 100.0)) if strategy == "REVERSAL" else 70.0
-    oos_prob, oos_conf, _ = oos_calibrated_win_rate(row)
-    oos_component = float(oos_prob) if np.isfinite(oos_prob) else 50.0
-    # Only a fraction of OOS evidence enters ranking; WFO is already inside QUANT.
-    oos_weight = 0.06 if np.isfinite(oos_prob) else 0.0
-    live_weight = 1.0 - oos_weight
 
-    priority = live_weight * (
-        0.55 * base
-        + 0.20 * gap_component
+    # 70% live signal quality + 30% explicit profit-opportunity overlay.
+    # OOS is 20% of the opportunity overlay (6% of total priority), while its
+    # own confidence shrinkage prevents a small sample from dominating the rank.
+    live_core = (
+        0.58 * base
+        + 0.22 * gap_component
         + 0.15 * mtf_component
-        + 0.07 * rr_component
-        + 0.03 * rev_component
-    ) + oos_weight * oos_component
-    # Slightly discount low-confidence OOS estimates toward 50 rather than
-    # allowing a noisy sample to create a large rank jump.
-    if np.isfinite(oos_prob):
-        priority = 0.94 * priority + 0.06 * (50.0 + (oos_component - 50.0) * oos_conf / 100.0)
+        + 0.05 * rev_component
+    )
+    priority = 0.70 * live_core + 0.30 * opportunity
     return float(np.clip(priority, 0.0, 100.0))
 
 def add_execution_priority(rows: list[dict]) -> None:
-    """Attach an execution-priority index and rank after all score updates."""
+    """Attach OOS estimates, profit-opportunity score and execution rank."""
     for r in rows:
         r["oos_est_win_rate"], r["oos_confidence"], r["oos_sample_trades"] = oos_calibrated_win_rate(r)
+
+    # Cross-sectional liquidity/volatility scoring must happen after OOS values
+    # exist and before the final execution-priority rank is calculated.
+    add_market_opportunity_score(rows)
+
+    for r in rows:
         r["execution_priority"] = execution_priority_score(r)
         r["execution_rank"] = None
 
@@ -1499,7 +1569,7 @@ def attach_validation(rows: list[dict], cfg: BacktestConfig, max_validate: int =
     return pd.DataFrame(rows)
 
 
-def run_parallel(symbols: list[str], cfg: BacktestConfig, workers: int = 6) -> pd.DataFrame:
+def run_parallel(symbols: list[str], cfg: BacktestConfig, workers: int = 6, market_meta: Optional[dict] = None) -> pd.DataFrame:
     """Two-stage scan: cheap 1D prefilter, then MTF only for strongest candidates.
 
     This cuts the expensive 1D/4H/1H request fan-out substantially while keeping
@@ -1535,6 +1605,12 @@ def run_parallel(symbols: list[str], cfg: BacktestConfig, workers: int = 6) -> p
 
     refined_map = {r["symbol"]: r for r in refined}
     final_rows = [refined_map.get(r["symbol"], r) for r in rows]
+
+    # Carry 24H quote volume into the final ranking layer. This avoids extra API
+    # calls because the ticker universe is already fetched in main().
+    meta = market_meta or {}
+    for r in final_rows:
+        r["quote_volume"] = float(meta.get(r["symbol"], {}).get("quote_volume", np.nan))
     return attach_validation(final_rows, cfg, max_validate=5)
 
 
@@ -1557,58 +1633,90 @@ def render_regime():
     score = float(regime.get("score", 50.0))
     if label == "Risk-On":
         direction = "상승 우세"
-        long_env, short_env = "유리", "불리"
+        long_env, short_env = "LONG 유리", "SHORT 불리"
         icon = "🟢"
     elif label == "Risk-Off":
         direction = "하락 우세"
-        long_env, short_env = "불리", "유리"
+        long_env, short_env = "LONG 불리", "SHORT 유리"
         icon = "🔴"
     else:
         label = "Mixed"
         direction = "방향 혼재"
-        long_env, short_env = "선별 필요", "선별 필요"
+        long_env, short_env = "LONG 선별", "SHORT 선별"
         icon = "🟡"
 
-    st.markdown("### 🌐 시장 상태")
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.metric("시장 레짐", f"{icon} {label}")
-    with c2:
-        st.metric("시장 방향", direction)
-    with c3:
-        st.metric("LONG 환경", long_env)
-    with c4:
-        st.metric("SHORT 환경", short_env)
+    # Main screen: keep the market regime to one compact, decision-oriented line.
+    st.markdown(
+        f"**🌐 시장상태**  {icon} **{label}** · {direction} · "
+        f"{long_env} · {short_env} · 시장점수 **{score:.0f}/100**"
+    )
 
-    btc = regime.get("btc")
-    btc_txt = fmt_price(float(btc["Close"])) if btc is not None else "-"
-    detail_txt = " · ".join(regime.get("details", []))
-    st.caption(f"BTC {btc_txt} · 시장점수 {score:.0f}/100" + (f" · {detail_txt}" if detail_txt else ""))
+    # Details are intentionally collapsed so the first screen stays compact.
+    with st.expander("시장상태 상세보기", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("시장 레짐", f"{icon} {label}")
+        with c2:
+            st.metric("시장 방향", direction)
+        with c3:
+            st.metric("LONG 환경", long_env)
+        with c4:
+            st.metric("SHORT 환경", short_env)
+
+        btc = regime.get("btc")
+        btc_txt = fmt_price(float(btc["Close"])) if btc is not None else "-"
+        detail_txt = " · ".join(regime.get("details", []))
+        st.caption(f"BTC {btc_txt} · 시장점수 {score:.0f}/100" + (f" · {detail_txt}" if detail_txt else ""))
     return regime
-
 
 
 def render_mobile_card(row: pd.Series):
     direction = row["direction"]
     icon = "🟢" if direction == "LONG" else ("🔴" if direction == "SHORT" else "⚪")
     sig = row["signal"]
+    prio = float(row.get("execution_priority", row.get("score", 0.0)))
+    opp = float(row.get("opportunity_score", 0.0))
+    oos_p = row.get("oos_est_win_rate", np.nan)
+    oos_c = float(row.get("oos_confidence", 0.0))
+    oos_txt = f"OOS {oos_p:.1f}%/{oos_c:.0f}" if np.isfinite(oos_p) else "OOS -"
+
     with st.container(border=True):
-        st.markdown(f"### {icon} {row['symbol']} · {direction}")
-        a, b, c, d = st.columns(4)
-        a.metric("QUANT", f"{row['score']:.0f}")
-        b.metric("현재가", fmt_price(row["price"]))
-        c.metric("R:R", f"1 : {sig['rr']:.2f}")
-        d.metric("MTF", f"{sig['mtf_score']:.0f}")
-        a, b, c = st.columns(3)
-        a.metric("ENTRY ZONE", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
-        b.metric("SL", fmt_price(sig["sl"]))
-        c.metric("🎯 TP", fmt_price(sig["tp"]))
-        a, b, c = st.columns(3)
-        a.metric("전략", sig["strategy"])
-        b.metric("시장상태", sig["market_state"])
-        c.metric("방향차", f"{row['score_gap']:.1f}")
-        st.caption(f"RSI {row['rsi']:.1f} · ATR {row['atr_pct']:.2f}% · POC {fmt_price(row['poc'])} · RVOL {row['rel_volume']:.2f}")
-        st.caption("판정: " + str(row.get("reason", "-")))
+        # Compact one-line decision view.
+        st.markdown(
+            f"**{icon} {row['symbol']} {direction}** · "
+            f"우선순위 **{prio:.0f}** · 수익기회 **{opp:.0f}** · "
+            f"R:R **1:{sig['rr']:.2f}** · MTF **{sig['mtf_score']:.0f}** · "
+            f"ENTRY **{fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])}** · "
+            f"SL **{fmt_price(sig['sl'])}** · TP **{fmt_price(sig['tp'])}**"
+        )
+        with st.expander("상세보기", expanded=False):
+            a, b, c, d = st.columns(4)
+            a.metric("실전 우선순위", f"{prio:.0f}")
+            b.metric("수익기회", f"{opp:.0f}")
+            c.metric("QUANT", f"{row['score']:.0f}")
+            d.metric("현재가", fmt_price(row["price"]))
+            a, b, c, d = st.columns(4)
+            a.metric("R:R", f"1 : {sig['rr']:.2f}")
+            b.metric("MTF", f"{sig['mtf_score']:.0f}")
+            c.metric("방향차", f"{row['score_gap']:.1f}")
+            d.metric("전략", sig["strategy"])
+            a, b, c = st.columns(3)
+            a.metric("ENTRY ZONE", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
+            b.metric("SL", fmt_price(sig["sl"]))
+            c.metric("🎯 TP", fmt_price(sig["tp"]))
+            st.caption(
+                f"시장상태 {sig['market_state']} · {oos_txt} · "
+                f"유동성 {float(row.get('liquidity_score', 0.0)):.0f} · "
+                f"변동성 {float(row.get('volatility_score', 0.0)):.0f} · "
+                f"ADX {float(row.get('adx_score', 0.0)):.0f} · "
+                f"24H 거래대금 {float(row.get('quote_volume', np.nan))/1_000_000:.1f}M USDT"
+            )
+            st.caption(
+                f"RSI {row['rsi']:.1f} · ATR {row['atr_pct']:.2f}% · "
+                f"POC {fmt_price(row['poc'])} · RVOL {row['rel_volume']:.2f}"
+            )
+            st.caption("판정: " + str(row.get("reason", "-")))
+
 
 def render_portfolio_candidates(df: pd.DataFrame):
     selected = df[df.get("portfolio_selected", False) == True].copy() if "portfolio_selected" in df else pd.DataFrame()
@@ -1622,7 +1730,8 @@ def render_portfolio_candidates(df: pd.DataFrame):
 
     selected = selected.sort_values("portfolio_rank")
     st.markdown("### 🚀 지금 실행할 후보")
-    st.caption("순위는 실전 우선순위입니다. QUANT 점수를 확률(승률)로 해석하지 않습니다.")
+    st.caption("한 줄 요약은 즉시 매매 판단용이며, 상세 수치와 근거는 각 후보의 '상세보기'에서 확인할 수 있습니다.")
+
     for _, row in selected.iterrows():
         sig = row["signal"]
         icon = "🟢" if row["direction"] == "LONG" else "🔴"
@@ -1631,26 +1740,42 @@ def render_portfolio_candidates(df: pd.DataFrame):
         pos_txt = f"{pos:,.0f} USDT" if np.isfinite(pos) else "-"
         risk_txt = f"{risk:,.2f} USDT" if np.isfinite(risk) else "-"
         prio = float(row.get("execution_priority", row.get("score", 0.0)))
-        with st.container(border=True):
-            st.markdown(f"### {icon} **#{int(row['portfolio_rank'])} {row['symbol']} · {row['direction']}**")
-            a, b, c, d = st.columns(4)
-            a.metric("실전 우선순위", f"{prio:.0f}")
-            b.metric("QUANT", f"{row['score']:.0f}")
-            c.metric("R:R", f"1 : {sig['rr']:.2f}")
-            d.metric("MTF", f"{sig['mtf_score']:.0f}")
-            a, b, c = st.columns(3)
-            a.metric("ENTRY", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
-            b.metric("🔴 SL", fmt_price(sig["sl"]))
-            c.metric("🎯 TP", fmt_price(sig["tp"]))
-            a, b, c = st.columns(3)
-            a.metric("포지션", pos_txt)
-            b.metric("SL 위험", risk_txt)
-            c.metric("전략", sig["strategy"])
-            oos_p = row.get("oos_est_win_rate", np.nan)
-        oos_c = row.get("oos_confidence", 0.0)
-        oos_txt = f" · OOS 추정 승률 {oos_p:.1f}% (신뢰도 {oos_c:.0f})" if np.isfinite(oos_p) else " · OOS 표본 부족"
-        st.caption(f"시장상태 {sig['market_state']} · {row.get('portfolio_reason', '')}{oos_txt}")
+        opp = float(row.get("opportunity_score", 0.0))
+        oos_p = row.get("oos_est_win_rate", np.nan)
+        oos_c = float(row.get("oos_confidence", 0.0))
+        oos_txt = f"OOS {oos_p:.1f}%/{oos_c:.0f}" if np.isfinite(oos_p) else "OOS -"
 
+        with st.container(border=True):
+            # Same compact one-line format as the market/result cards.
+            st.markdown(
+                f"**{icon} #{int(row['portfolio_rank'])} {row['symbol']} {row['direction']}** · "
+                f"우선순위 **{prio:.0f}** · 수익기회 **{opp:.0f}** · "
+                f"R:R **1:{sig['rr']:.2f}** · MTF **{sig['mtf_score']:.0f}** · "
+                f"ENTRY **{fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])}** · "
+                f"SL **{fmt_price(sig['sl'])}** · TP **{fmt_price(sig['tp'])}**"
+            )
+            with st.expander("상세보기", expanded=False):
+                a, b, c, d = st.columns(4)
+                a.metric("실전 우선순위", f"{prio:.0f}")
+                b.metric("수익기회", f"{opp:.0f}")
+                c.metric("QUANT", f"{row['score']:.0f}")
+                d.metric("R:R", f"1 : {sig['rr']:.2f}")
+                a, b, c = st.columns(3)
+                a.metric("ENTRY", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
+                b.metric("🔴 SL", fmt_price(sig["sl"]))
+                c.metric("🎯 TP", fmt_price(sig["tp"]))
+                a, b, c = st.columns(3)
+                a.metric("포지션", pos_txt)
+                b.metric("SL 위험", risk_txt)
+                c.metric("전략", sig["strategy"])
+                st.caption(
+                    f"시장상태 {sig['market_state']} · {oos_txt} · "
+                    f"유동성 {float(row.get('liquidity_score', 0.0)):.0f} · "
+                    f"변동성 {float(row.get('volatility_score', 0.0)):.0f} · "
+                    f"ADX {float(row.get('adx_score', 0.0)):.0f} · "
+                    f"24H 거래대금 {float(row.get('quote_volume', np.nan))/1_000_000:.1f}M USDT"
+                )
+                st.caption(f"전략 {sig['strategy']} · 시장상태 {sig['market_state']} · {row.get('portfolio_reason', '')}")
 
 
 def render_results(df: pd.DataFrame):
@@ -1661,6 +1786,10 @@ def render_results(df: pd.DataFrame):
     with st.expander("🔎 후보 상세 / 전체 분석 결과", expanded=False):
         display = df.copy()
         display["우선순위"] = display["execution_priority"].round(1) if "execution_priority" in display else display["score"].round(1)
+        display["수익기회"] = display["opportunity_score"].round(1) if "opportunity_score" in display else np.nan
+        display["유동성"] = display["liquidity_score"].round(0) if "liquidity_score" in display else np.nan
+        display["변동성"] = display["volatility_score"].round(0) if "volatility_score" in display else np.nan
+        display["ADX"] = display["adx_score"].round(0) if "adx_score" in display else np.nan
         display["score"] = display["score"].round(1)
         display["price"] = display["price"].map(fmt_price)
         display["30D"] = display["change_30d"].round(2)
@@ -1680,10 +1809,11 @@ def render_results(df: pd.DataFrame):
         display["SL위험"] = display["risk_used"].round(0) if "risk_used" in display else np.nan
         display["Status"] = display["direction"]
         display["판정사유"] = display["reason"]
-        cols = ["symbol", "Status", "포트폴리오", "우선순위", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
+        cols = ["symbol", "Status", "포트폴리오", "우선순위", "수익기회", "유동성", "변동성", "ADX", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
         st.dataframe(display[cols], use_container_width=True, hide_index=True, column_config={
             "symbol":"종목", "Status":"최종판정", "포트폴리오":"실행순위", "우선순위":"실전 우선순위",
             "score":"QUANT", "price":"현재가", "RR":"R:R", "MTF":"MTF", "OOS추정승률":"OOS 추정 승률%", "OOS신뢰도":"OOS 신뢰도", "WFO":"WFO 견고성",
+            "수익기회":"수익기회 점수", "유동성":"유동성", "변동성":"변동성", "ADX":"ADX",
             "OOS":"OOS%", "Win":"OOS 승률%", "PF":"PF", "MDD":"MDD%", "Trades":"거래수",
             "포지션":"권장 포지션(USDT)", "SL위험":"SL 위험금액", "판정사유":"판정사유",
         })
@@ -1704,7 +1834,7 @@ def render_results(df: pd.DataFrame):
 
 def main():
     st.title("🔥 Crypto Quant · 실전 매매판")
-    st.caption("확정봉 · 1D/4H/1H MTF · Trend/Reverse · 단일 TP/SL · WFO/OOS는 검증 참고")
+    st.caption("확정봉 · 1D/4H/1H MTF · Trend/Reverse · 단일 TP/SL · 거래대금×변동성×ADX×R:R×OOS 수익기회 점수")
 
     with st.sidebar:
         st.header("⚙️ 분석 설정")
@@ -1757,6 +1887,10 @@ def main():
         .head(TOP_N)
     )
     symbols_top = universe["symbol"].tolist()
+    market_meta = {
+        row["symbol"]: {"quote_volume": float(row["quote_volume"])}
+        for _, row in universe.iterrows()
+    }
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -1786,7 +1920,7 @@ def main():
     if quick or full:
         symbols = symbols_top[:10] if quick else symbols_top
         with st.spinner(f"{len(symbols)}개 종목 분석 중... (시장레짐 → 추세/역추세 → Entry/TP/SL)"):
-            result = run_parallel(symbols, cfg, workers=6)
+            result = run_parallel(symbols, cfg, workers=6, market_meta=market_meta)
         st.session_state["quant_results"] = result
         st.session_state["quant_time"] = pd.Timestamp.now(tz="UTC")
 
