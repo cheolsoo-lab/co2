@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V4 (Final Fixed Version)
-- Multi-Exchange Fallback Support (Binance, Bybit, Mexc, Gateio)
-- UI & Data separation: [🔥 Trend Following / Aggressive] vs [🛡️ Defensive/Reversal]
-- Dynamic Regime-Aware ATR TP Extension (4.0 ~ 6.0x for Trends)
-- Funding Rate & Orderbook Slip Cost Integration
-- Logistic Regression / Ensemble Weight Optimization
-- Hierarchical Multi-Timeframe (MTF) Filtering
+Crypto Quant Dashboard V5
+- Intuitive Long (🟢) vs Short (🔴) Visual Separation
+- Explicit TP, SL, and Entry Price Cards for Recommended Coins
+- Multi-Exchange Fallback, Dynamic ATR TP Extension, ML Ensemble, Hierarchical MTF
 """
 
 from __future__ import annotations
@@ -30,7 +27,7 @@ from sklearn.linear_model import LogisticRegression
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V4",
+    page_title="🔥 Crypto Quant Dashboard V5",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -68,7 +65,6 @@ def make_exchange(exchange_id: str):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_tickers_with_fallback() -> tuple[pd.DataFrame, str]:
-    """바이낸스 IP 제한 및 접속 장애 시 Bybit, Mexc 등으로 자동 전환하는 Fallback 로직"""
     for exchange_id in DEFAULT_EXCHANGES:
         try:
             ex = make_exchange(exchange_id)
@@ -338,19 +334,24 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
 
 
 # ============================================================
-# 7. STREAMLIT UI (분리된 탭 구성)
+# 7. STREAMLIT UI (직관적 롱/숏 분리 및 TP/SL 카드 렌더링)
 # ============================================================
 
+def fmt_price(x):
+    if x >= 1000: return f"{x:,.2f}"
+    if x >= 1: return f"{x:,.4f}"
+    return f"{x:,.8f}"
+
+
 def main():
-    st.title("🔥 Crypto Quant Dashboard V4")
-    st.caption("공격형(대세 추종 알파) & 방어형(숏컷 헌터) 완벽 분리형 실전 매매판")
+    st.title("🔥 Crypto Quant Dashboard V5")
+    st.caption("공격형(대세 추종 알파) & 방어형(숏컷 헌터) 멀티 매매판 (TP / SL 표기)")
 
     with st.sidebar:
         st.header("⚙️ 설정")
         min_volume = st.number_input("최소 거래대금 (USDT)", 100_000.0, 50_000_000.0, 1_000_000.0, 100_000.0)
         account_size = st.number_input("계좌 금액 (USDT)", 100.0, 10_000_000.0, 10_000.0, 100.0)
 
-    # Fallback 적용된 거래소 데이터 연동
     market, active_exchange = fetch_tickers_with_fallback()
     if market.empty:
         st.error("모든 지원 거래소에서 시세를 불러오지 못했습니다. 네트워크 상태를 확인해주세요.")
@@ -368,9 +369,9 @@ def main():
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v4_results"] = results
+        st.session_state["v5_results"] = results
 
-    results = st.session_state.get("v4_results", [])
+    results = st.session_state.get("v5_results", [])
     if results:
         df_res = pd.DataFrame(results)
         
@@ -381,18 +382,54 @@ def main():
             agg_rows = df_res[df_res["mode_type"] == "AGGRESSIVE"]
             if agg_rows.empty:
                 st.info("현재 공격적 추세 조건을 만족하는 종목이 없습니다.")
+            
             for _, row in agg_rows.iterrows():
                 sig = row["signal"]
-                st.success(f"**{row['symbol']} ({row['direction']})** | 손익비: 1:{sig['rr']:.2f} | 앙상블 점수: {row['score']:.1f} | TP: {sig['tp']:,.4f}")
+                is_long = row["direction"] == "LONG"
+                
+                # 🟢 롱과 숏의 직관적인 디자인 분기 (컨테이너 및 뱃지)
+                badge = "🟢 **LONG (매수)**" if is_long else "🔴 **SHORT (매도)**"
+                
+                with st.container(border=True):
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.markdown(f"### {row['symbol']}")
+                    col2.markdown(f"방향: {badge}")
+                    col3.metric("앙상블 점수", f"{row['score']:.1f}")
+                    col4.metric("손익비 (R:R)", f"1 : {sig['rr']:.2f}")
+
+                    # TP, SL, 진입가 명확한 박스 분리 표기
+                    t1, t2, t3 = st.columns(3)
+                    t1.metric("🎯 목표가 (TP)", fmt_price(sig['tp']))
+                    t2.metric("🛑 손절가 (SL)", fmt_price(sig['sl']))
+                    t3.metric("⚡ 진입 구간", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
+                    
+                    st.caption(f"상세 사유: {row['reason']}")
 
         with tab2:
-            st.markdown("### 🛡️ 방어형 방어 헌터 포지션 (짧은 익절 / 칼손절)")
+            st.markdown("### 🛡️ 방어형 숏컷 헌터 포지션 (짧은 익절 / 칼손절)")
             def_rows = df_res[df_res["mode_type"] == "DEFENSIVE"]
             if def_rows.empty:
                 st.info("현재 방어적 국면에 부합하는 종목이 없습니다.")
+                
             for _, row in def_rows.iterrows():
                 sig = row["signal"]
-                st.warning(f"**{row['symbol']} ({row['direction']})** | 손익비: 1:{sig['rr']:.2f} | 앙상블 점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%")
+                is_long = row["direction"] == "LONG"
+                
+                badge = "🟢 **LONG (매수)**" if is_long else "🔴 **SHORT (매도)**"
+                
+                with st.container(border=True):
+                    col1, col2, col3, col4 = st.columns(4)
+                    col1.markdown(f"### {row['symbol']}")
+                    col2.markdown(f"방향: {badge}")
+                    col3.metric("앙상블 점수", f"{row['score']:.1f}")
+                    col4.metric("손익비 (R:R)", f"1 : {sig['rr']:.2f}")
+
+                    t1, t2, t3 = st.columns(3)
+                    t1.metric("🎯 목표가 (TP)", fmt_price(sig['tp']))
+                    t2.metric("🛑 손절가 (SL)", fmt_price(sig['sl']))
+                    t3.metric("⚡ 진입 구간", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
+                    
+                    st.caption(f"상세 사유: {row['reason']} | 펀딩비: {row['funding_rate']*100:.4f}%")
 
 
 if __name__ == "__main__":
