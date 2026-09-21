@@ -1106,9 +1106,12 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig, use_mtf: bool = True) -> Op
             reasons.insert(0, wait_reason)
         reasons.append(f"Gate {gate['profile']}")
 
+        daily_ret = df["Close"].pct_change().dropna().tail(30)
+        vol_30d_pct = float(daily_ret.std(ddof=1) * math.sqrt(30) * 100) if len(daily_ret) >= 10 else np.nan
         return {
             "symbol": symbol, "exchange": exchange_id, "price": float(latest["Close"]),
             "change_30d": float((latest["Close"] / df["Close"].iloc[-31] - 1) * 100),
+            "vol_30d_pct": vol_30d_pct,
             "direction": status, "signal_direction": best_sig["direction"],
             "score": float(best_sig["score"]), "signal": best_sig,
             "wf": empty_metrics(), "rsi": float(latest["RSI14"]), "adx": float(latest["ADX14"]),
@@ -1263,14 +1266,13 @@ def add_market_opportunity_score(rows: list[dict]) -> None:
     volumes = [float(r.get("quote_volume", np.nan)) for r in rows]
     log_volumes = [math.log10(max(v, 1.0)) if np.isfinite(v) and v > 0 else np.nan for v in volumes]
     atr_values = [float(r.get("atr_pct", np.nan)) for r in rows]
+    vol_30d_values = [float(r.get("vol_30d_pct", np.nan)) for r in rows]
 
     finite_atr = np.asarray([x for x in atr_values if np.isfinite(x) and x > 0], dtype=float)
     median_atr = float(np.median(finite_atr)) if finite_atr.size else 2.0
-    # Adaptive sweet spot: high enough to create room for TP, but not the most
-    # extreme contracts in the universe. Keep it in a practical 2-5% ATR band.
     target_atr = float(np.clip(median_atr * 1.8, 2.0, 5.0))
 
-    for r, log_vol, atr in zip(rows, log_volumes, atr_values):
+    for r, log_vol, atr, vol_30d in zip(rows, log_volumes, atr_values, vol_30d_values):
         sig = r.get("signal", {}) or {}
         adx = float(r.get("adx", sig.get("adx", 0.0)))
         rr = float(sig.get("rr", 0.0))
@@ -1289,22 +1291,28 @@ def add_market_opportunity_score(rows: list[dict]) -> None:
         else:
             volatility = 0.0
 
+        vol_30d_score = _cross_sectional_percentile(vol_30d_values, vol_30d)
         adx_score = float(np.clip((adx - 15.0) / 20.0 * 100.0, 0.0, 100.0))
         rr_score = float(np.clip(50.0 + (rr - 1.0) * 35.0, 0.0, 100.0))
         oos_prob = float(r.get("oos_est_win_rate", np.nan))
         oos_conf = float(r.get("oos_confidence", 0.0))
         oos_score = 50.0 + (oos_prob - 50.0) * (oos_conf / 100.0) if np.isfinite(oos_prob) else 50.0
 
+        # Profit-opportunity blend: liquidity + 30D realized volatility are the
+        # primary universe-selection signals, while ATR/ADX/R:R/OOS keep the
+        # ranking tied to tradability and actual setup quality.
         opportunity = (
-            0.22 * liquidity
-            + 0.25 * volatility
-            + 0.18 * adx_score
+            0.20 * liquidity
+            + 0.20 * vol_30d_score
+            + 0.10 * volatility
+            + 0.15 * adx_score
             + 0.15 * rr_score
             + 0.20 * oos_score
         )
 
         r["liquidity_score"] = float(np.clip(liquidity, 0.0, 100.0))
         r["volatility_score"] = float(np.clip(volatility, 0.0, 100.0))
+        r["vol_30d_score"] = float(np.clip(vol_30d_score, 0.0, 100.0))
         r["adx_score"] = float(np.clip(adx_score, 0.0, 100.0))
         r["rr_score"] = float(np.clip(rr_score, 0.0, 100.0))
         r["oos_opportunity_score"] = float(np.clip(oos_score, 0.0, 100.0))
@@ -1707,6 +1715,7 @@ def render_mobile_card(row: pd.Series):
             st.caption(
                 f"시장상태 {sig['market_state']} · {oos_txt} · "
                 f"유동성 {float(row.get('liquidity_score', 0.0)):.0f} · "
+                f"1M변동성 {float(row.get('vol_30d_pct', np.nan)):.1f}% · "
                 f"변동성 {float(row.get('volatility_score', 0.0)):.0f} · "
                 f"ADX {float(row.get('adx_score', 0.0)):.0f} · "
                 f"24H 거래대금 {float(row.get('quote_volume', np.nan))/1_000_000:.1f}M USDT"
@@ -1789,6 +1798,7 @@ def render_results(df: pd.DataFrame):
         display["수익기회"] = display["opportunity_score"].round(1) if "opportunity_score" in display else np.nan
         display["유동성"] = display["liquidity_score"].round(0) if "liquidity_score" in display else np.nan
         display["변동성"] = display["volatility_score"].round(0) if "volatility_score" in display else np.nan
+        display["1M변동성"] = display["vol_30d_pct"].round(2) if "vol_30d_pct" in display else np.nan
         display["ADX"] = display["adx_score"].round(0) if "adx_score" in display else np.nan
         display["score"] = display["score"].round(1)
         display["price"] = display["price"].map(fmt_price)
@@ -1809,11 +1819,11 @@ def render_results(df: pd.DataFrame):
         display["SL위험"] = display["risk_used"].round(0) if "risk_used" in display else np.nan
         display["Status"] = display["direction"]
         display["판정사유"] = display["reason"]
-        cols = ["symbol", "Status", "포트폴리오", "우선순위", "수익기회", "유동성", "변동성", "ADX", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
+        cols = ["symbol", "Status", "포트폴리오", "우선순위", "수익기회", "유동성", "1M변동성", "변동성", "ADX", "score", "price", "RR", "MTF", "OOS추정승률", "OOS신뢰도", "WFO", "OOS", "Win", "PF", "MDD", "Trades", "포지션", "SL위험", "판정사유"]
         st.dataframe(display[cols], use_container_width=True, hide_index=True, column_config={
             "symbol":"종목", "Status":"최종판정", "포트폴리오":"실행순위", "우선순위":"실전 우선순위",
             "score":"QUANT", "price":"현재가", "RR":"R:R", "MTF":"MTF", "OOS추정승률":"OOS 추정 승률%", "OOS신뢰도":"OOS 신뢰도", "WFO":"WFO 견고성",
-            "수익기회":"수익기회 점수", "유동성":"유동성", "변동성":"변동성", "ADX":"ADX",
+            "수익기회":"수익기회 점수", "유동성":"유동성", "1M변동성":"1개월 실현변동성%", "변동성":"단기 변동성", "ADX":"ADX",
             "OOS":"OOS%", "Win":"OOS 승률%", "PF":"PF", "MDD":"MDD%", "Trades":"거래수",
             "포지션":"권장 포지션(USDT)", "SL위험":"SL 위험금액", "판정사유":"판정사유",
         })
@@ -1834,7 +1844,7 @@ def render_results(df: pd.DataFrame):
 
 def main():
     st.title("🔥 Crypto Quant · 실전 매매판")
-    st.caption("확정봉 · 1D/4H/1H MTF · Trend/Reverse · 단일 TP/SL · 거래대금×변동성×ADX×R:R×OOS 수익기회 점수")
+    st.caption("확정봉 · 1D/4H/1H MTF · Trend/Reverse · 단일 TP/SL · 거래대금×1개월 변동성×ATR×ADX×R:R×OOS 수익기회 점수")
 
     with st.sidebar:
         st.header("⚙️ 분석 설정")
@@ -1878,9 +1888,9 @@ def main():
         return
 
     market = market[market["quote_volume"] >= min_volume].copy()
-    # Exactly TOP_N liquid USDT pairs are scanned. This prevents the previous
-    # "top 30 + majors" expansion from silently turning into 40+ symbols.
-    TOP_N = 30
+    # Analyze the top 50 liquid USDT pairs. 24H quote volume defines the
+    # tradable universe; 30D realized volatility is used later for ranking.
+    TOP_N = 50
     universe = (
         market.sort_values("quote_volume", ascending=False)
         .drop_duplicates("symbol")
@@ -1892,13 +1902,10 @@ def main():
         for _, row in universe.iterrows()
     }
 
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("분석 가능 종목", len(market))
-    with c2:
-        st.metric("검토 종목", len(symbols_top))
-    with c3:
-        st.metric("대상", "상위 30 (거래대금)")
+    st.markdown(
+        f"**분석현황** · 분석가능 **{len(market)}종목** · 검토 **{len(symbols_top)}종목** · "
+        f"대상 **거래대금 상위 {TOP_N} + 1개월 변동성 반영**"
+    )
 
     cfg = BacktestConfig(
         fee_rate=fee,
@@ -1915,7 +1922,7 @@ def main():
 
     # Mobile-friendly buttons
     quick = st.button("⚡ 빠른 분석", use_container_width=True)
-    full = st.button("🔬 정밀 분석 · 상위 30", use_container_width=True)
+    full = st.button("🔬 정밀 분석 · 상위 50", use_container_width=True)
 
     if quick or full:
         symbols = symbols_top[:10] if quick else symbols_top
