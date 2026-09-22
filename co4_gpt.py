@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V37.0 (YouTube Master-Class Enhanced Institutional Engine)
-- Target Pool: BTC + Major Coins + Top 50 24H Volatility Momentum Coins
+Crypto Quant Dashboard V39.0 (Dynamic WFO & Profit Maximization Edition)
+- Target Pool: BTC + Majors + Top 100 Liquidity Volume Coins
 - Enhanced Features:
-  1. Structural Support/Resistance Snapping (Burger-hyung Style)
-  2. Extreme Funding Rate Squeeze Protection (Mayo Style)
-  3. Volume Acceleration Momentum Filter (Coinone Style)
-  4. Dynamic ATR Scaling for Volatility Explosions (Danta-rang Style)
-- Risk-Reward Ratio >= 2.0 Filter & Bitget Auto OCO Futures Execution
+  1. Dynamic WFO ATR Scaling (Adapts TP/SL to real-time market volatility regimes)
+  2. Chart-Driven Flexible Risk-Reward (Unlocks 1:2.5 to 1:4+ potential based on swing structures)
+  3. Anti-Chasing Exhaustion Filter (Blocks coins pumped > +12% or dumped < -12%)
+  4. 4H/1H Multi-Timeframe Trend Alignment & Safe Leverage Guide
 """
 
 from __future__ import annotations
@@ -26,7 +25,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V37.0",
+    page_title="🚀 Crypto Quant Dashboard V39.0 Pro",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -36,7 +35,7 @@ st.markdown("""
 <style>
     .stApp { background-color: #f8fafc; color: #1e293b; }
     .macro-card {
-        background: #ffffff; border: 1px solid #e2e8f0; border-left: 6px solid #6366f1;
+        background: #ffffff; border: 1px solid #e2e8f0; border-left: 6px solid #4f46e5;
         padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); margin-bottom: 20px;
     }
     .card-agg-long {
@@ -65,18 +64,17 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 DEFAULT_EXCHANGES = ["bitget", "binance", "bybit"]
-MAJOR_COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT", "DOGE/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "SUI/USDT"]
+MAJOR_COINS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "BNB/USDT", "ADA/USDT", "AVAX/USDT", "LINK/USDT", "SUI/USDT"]
 
 SECTOR_MAP = {
     "BTC/USDT": "Macro / L1", "ETH/USDT": "Layer 1", "SOL/USDT": "Layer 1",
     "XRP/USDT": "Payment", "BNB/USDT": "Exchange", "ADA/USDT": "Layer 1",
-    "AVAX/USDT": "Layer 1", "SUI/USDT": "Layer 1", "DOGE/USDT": "Meme",
-    "SHIB/USDT": "Meme", "PEPE/USDT": "Meme", "LINK/USDT": "Oracle / DeFi"
+    "AVAX/USDT": "Layer 1", "SUI/USDT": "Layer 1", "LINK/USDT": "Oracle / DeFi"
 }
 
 
 # ============================================================
-# 1. DATA ACCESS & INSTITUTIONAL METRICS ENGINE
+# 1. DATA ACCESS & WFO ENGINE
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -167,13 +165,13 @@ def calculate_volume_profile_poc(df_ohlcv: pd.DataFrame, bins: int = 25) -> floa
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def fetch_institutional_data_v370(exchange_id: str, symbol: str) -> Optional[dict]:
+def fetch_dynamic_data_v390(exchange_id: str, symbol: str) -> Optional[dict]:
     try:
         ex = make_exchange(exchange_id)
         raw_symbol = symbol if exchange_id != "binance" else (f"{symbol.replace('/','')}:USDT" if ":" not in symbol else symbol)
 
-        df_1d = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="1d", limit=60), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
-        df_1d["EMA20"] = ta.trend.EMAIndicator(df_1d["Close"], window=20).ema_indicator()
+        df_4h = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="4h", limit=50), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+        df_4h["EMA20"] = ta.trend.EMAIndicator(df_4h["Close"], window=20).ema_indicator()
 
         df_1h = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="1h", limit=60), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         df_1h["EMA20"] = ta.trend.EMAIndicator(df_1h["Close"], window=20).ema_indicator()
@@ -181,23 +179,16 @@ def fetch_institutional_data_v370(exchange_id: str, symbol: str) -> Optional[dic
         df_1h["ATR14"] = ta.volatility.AverageTrueRange(df_1h["High"], df_1h["Low"], df_1h["Close"], window=14).average_true_range()
         df_1h["VOL_MA20"] = df_1h["Volume"].rolling(20).mean()
         df_1h["REL_VOLUME"] = df_1h["Volume"] / df_1h["VOL_MA20"]
-
-        # 3. 거래대금/볼륨 가속도 (Coinone 스타일)
         df_1h["VOL_ACCEL"] = df_1h["Volume"] / (df_1h["Volume"].shift(1) + 1e-8)
 
         df_1h["BUY_PRESSURE"] = (df_1h["Close"] - df_1h["Low"]) / (df_1h["High"] - df_1h["Low"] + 1e-8)
         df_1h["CVD_PROXY"] = (df_1h["BUY_PRESSURE"] - 0.5) * df_1h["Volume"]
 
-        # 1. 수평 매물대 스윙 벽 산출 (Burger-hyung 스타일)
         recent_20_h = df_1h.tail(20)
         swing_high = float(recent_20_h["High"].max())
         swing_low = float(recent_20_h["Low"].min())
 
-        df_30m = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="30m", limit=50), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
-        df_30m["EMA9"] = ta.trend.EMAIndicator(df_30m["Close"], window=9).ema_indicator()
-        df_30m["RSI9"] = ta.momentum.RSIIndicator(df_30m["Close"], window=9).rsi()
-
-        if len(df_1d) < 20 or len(df_1h) < 20 or len(df_30m) < 20:
+        if len(df_4h) < 20 or len(df_1h) < 20:
             return None
 
         poc_price = calculate_volume_profile_poc(df_1h, bins=25)
@@ -210,12 +201,22 @@ def fetch_institutional_data_v370(exchange_id: str, symbol: str) -> Optional[dic
             pass
 
         return {
-            "df_1d": df_1d, "df_1h": df_1h, "df_30m": df_30m,
+            "df_4h": df_4h, "df_1h": df_1h,
             "poc": poc_price, "swing_high": swing_high, "swing_low": swing_low,
             "funding_rate": funding_rate, "exchange": exchange_id.upper()
         }
     except Exception:
         return None
+
+
+def run_walk_forward_optimization(market_df: pd.DataFrame) -> dict:
+    avg_volatility = market_df["change_pct"].abs().mean()
+    if avg_volatility > 2.2:
+        return {"atr_mult": 2.8, "tp_extension": 2.5, "regime": "🚀 고변동성 대세 상승/하락장 (확장형 TP 적용)"}
+    elif avg_volatility < 0.9:
+        return {"atr_mult": 1.8, "tp_extension": 1.8, "regime": "⚖️ 저변동성 박스권장 (방어형 TP 적용)"}
+    else:
+        return {"atr_mult": 2.3, "tp_extension": 2.2, "regime": "📊 표준 모멘텀장 (균형형 동적 TP 적용)"}
 
 
 def execute_bitget_futures_order(symbol: str, pos_type: str, tp: float, sl: float, api_key: str, secret: str, password: str):
@@ -229,28 +230,22 @@ def execute_bitget_futures_order(symbol: str, pos_type: str, tp: float, sl: floa
             return False, "USDT 잔고가 부족합니다."
         target_usdt_size = total_usdt * 0.01
 
-        markets = ex.load_markets()
-        market_info = markets.get(formatted_symbol, {})
-        max_leverage = 20
+        safe_leverage = 3
         try:
-            if "limits" in market_info and "leverage" in market_info["limits"]:
-                max_lev_limit = market_info["limits"]["leverage"].get("max")
-                if max_lev_limit:
-                    max_leverage = int(max_lev_limit)
-            ex.set_leverage(max_leverage, formatted_symbol)
+            ex.set_leverage(safe_leverage, formatted_symbol)
         except Exception:
             pass
 
         ticker = ex.fetch_ticker(formatted_symbol)
         current_price = ticker["last"]
-        notional_size = target_usdt_size * max_leverage
+        notional_size = target_usdt_size * safe_leverage
         amount = notional_size / current_price
 
         side = "buy" if pos_type == "LONG" else "sell"
         close_side = "sell" if pos_type == "LONG" else "buy"
 
         entry_order = ex.create_market_order(formatted_symbol, side, amount)
-        msg_result = f"레버리지 {max_leverage}배 | 1% 자산 진입 성공 (체결가: {entry_order.get('average', current_price):,.4f})"
+        msg_result = f"안전 레버리지 {safe_leverage}배 | 1% 자산 진입 성공 (체결가: {entry_order.get('average', current_price):,.4f})"
 
         try:
             ex.create_order(
@@ -276,140 +271,97 @@ def execute_bitget_futures_order(symbol: str, pos_type: str, tp: float, sl: floa
 
 
 # ============================================================
-# 2. WFO & QUANT ENGINE (MASTER-CLASS ENHANCED)
+# 2. DYNAMIC QUANT ENGINE (V39.0)
 # ============================================================
 
-def run_walk_forward_optimization(market_df: pd.DataFrame) -> dict:
-    avg_volatility = market_df["change_pct"].abs().mean()
-    if avg_volatility > 2.0:
-        return {"atr_mult": 2.6, "rs_cut": 0.18, "regime": "🚀 고변동성 주도주 장세 (동적 ATR 확장 적용)"}
-    elif avg_volatility < 0.8:
-        return {"atr_mult": 1.9, "rs_cut": 0.04, "regime": "⚖️ 박스권 장세 (방어형 ATR 적용)"}
-    else:
-        return {"atr_mult": 2.3, "rs_cut": 0.09, "regime": "📊 표준 모멘텀 장세 (균형형 ATR 적용)"}
-
-
-def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
-    btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
-    btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
-
-    st.markdown(f"""
-    <div class="macro-card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <h3 style="margin: 0; color: #1e293b;">🌐 V37.0 유튜브 마스터클래스 종합분석 & 알파 엔진</h3>
-            <span style="background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 14px;">
-                {wfo_res['regime']}
-            </span>
-        </div>
-        <p style="font-size: 15px; font-weight: 600; color: #0f172a; margin-bottom: 15px;">
-            💡 고수들의 4대 매매철학 융합: <span style="color: #4f46e5;">수평 매물대벽 스냅핑 + 펀딩비 스퀴즈 방어 + 볼륨 가속도 + 동적 ATR 확장</span>
-        </p>
-        <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 12px 0;">
-        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
-            <div class="stat-pill">₿ BTC 24H 변동률: <b>{btc_change:+.2f}%</b></div>
-            <div class="stat-pill">📊 분석 타겟 풀: <b>메이저 + 변동성 상위 50</b></div>
-            <div class="stat-pill">⚡ 시스템 상태: <b>유튜브 마스터 알고리즘 작동 중</b></div>
-        </div>
-    </div>
-    """, unsafe_allow_html=True)
-    st.divider()
-
-
-def analyze_symbol_v370(symbol: str, exchange_id: str, market_avg_change: float, btc_change: float, wfo_params: dict) -> Optional[dict]:
-    data = fetch_institutional_data_v370(exchange_id.lower(), symbol)
+def analyze_symbol_v390(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
+    data = fetch_dynamic_data_v390(exchange_id.lower(), symbol)
     if not data:
         return None
     
-    df_1d = data["df_1d"]
+    df_4h = data["df_4h"]
     df_1h = data["df_1h"]
-    df_30m = data["df_30m"]
     poc = data["poc"]
     swing_high = data["swing_high"]
     swing_low = data["swing_low"]
     funding_rate = data["funding_rate"]
 
-    r_1d = df_1d.iloc[-2]
+    r_4h = df_4h.iloc[-1]
     r_1h = df_1h.iloc[-1]
-    r_30m = df_30m.iloc[-1]
 
     close = float(r_1h["Close"])
     atr = float(r_1h["ATR14"]) if pd.notna(r_1h["ATR14"]) and r_1h["ATR14"] > 0 else close * 0.02
     rsi_1h = float(r_1h["RSI14"]) if pd.notna(r_1h["RSI14"]) else 50.0
-    rsi_30m = float(r_30m["RSI9"]) if pd.notna(r_30m["RSI9"]) else 50.0
     rel_vol = float(r_1h["REL_VOLUME"]) if pd.notna(r_1h["REL_VOLUME"]) else 1.0
     vol_accel = float(r_1h["VOL_ACCEL"]) if pd.notna(r_1h["VOL_ACCEL"]) else 1.0
     cvd_val = float(r_1h["CVD_PROXY"]) if pd.notna(r_1h["CVD_PROXY"]) else 0.0
     
-    if len(df_1h) >= 6:
-        symbol_change_24h = float((close - df_1h.iloc[-6]["Close"]) / df_1h.iloc[-6]["Close"] * 100)
+    if len(df_1h) >= 24:
+        symbol_change_24h = float((close - df_1h.iloc[-24]["Close"]) / df_1h.iloc[-24]["Close"] * 100)
     else:
         symbol_change_24h = 0.0
         
     relative_strength = symbol_change_24h - market_avg_change
-    rs_cut = wfo_params["rs_cut"]
-    base_atr_mult = wfo_params["atr_mult"]
 
-    # 4. 동적 ATR 스케일링 (Danta-rang 스타일: 변동성 및 볼륨 폭발 시 TP 확장)
-    dynamic_atr_mult = base_atr_mult * (1.25 if rel_vol > 1.8 else 1.0)
+    # 급등 피로도 필터 (Anti-Chasing Filter)
+    if symbol_change_24h > 12.0 or symbol_change_24h < -12.0:
+        return None
 
     group, pos_type = None, None
 
-    is_30m_long_momentum = float(r_30m["Close"]) > float(r_30m["EMA9"]) and rsi_30m < 75
-    is_30m_short_momentum = float(r_30m["Close"]) < float(r_30m["EMA9"]) and rsi_30m > 25
+    is_4h_long_trend = float(r_4h["Close"]) >= float(r_4h["EMA20"]) * 0.995
+    is_4h_short_trend = float(r_4h["Close"]) <= float(r_4h["EMA20"]) * 1.005
 
-    # 2. 극단적 펀딩비 스퀴즈 방어 (Mayo 스타일: 과열된 롱/숏 포지션 진입 원천 차단)
-    is_funding_safe_long = funding_rate <= 0.0008 and funding_rate > -0.001
-    is_funding_safe_short = funding_rate >= -0.0008 and funding_rate < 0.001
+    is_funding_safe_long = funding_rate <= 0.0006 and funding_rate > -0.001
+    is_funding_safe_short = funding_rate >= -0.0006 and funding_rate < 0.001
 
-    is_poc_long_valid = close >= poc * 0.992
-    is_poc_short_valid = close <= poc * 1.008
+    is_poc_long_valid = close >= poc * 0.995
+    is_poc_short_valid = close <= poc * 1.005
 
-    # 3. 볼륨 가속도 필터 (Coinone 스타일: 거래대금 급증 가속도 요구)
-    is_vol_accelerating = vol_accel >= 0.85
-
-    if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.0 and is_vol_accelerating and relative_strength > rs_cut and is_30m_long_momentum and is_funding_safe_long and is_poc_long_valid and cvd_val >= 0:
+    if is_4h_long_trend and float(r_1h["Close"]) >= float(r_1h["EMA20"]) * 0.995 and 42 <= rsi_1h <= 65 and is_funding_safe_long and is_poc_long_valid and cvd_val >= 0:
         group, pos_type = "AGGRESSIVE", "LONG"
-    elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.0 and is_vol_accelerating and relative_strength < -rs_cut and is_30m_short_momentum and is_funding_safe_short and is_poc_short_valid and cvd_val <= 0:
+    elif is_4h_short_trend and float(r_1h["Close"]) <= float(r_1h["EMA20"]) * 1.005 and 35 <= rsi_1h <= 58 and is_funding_safe_short and is_poc_short_valid and cvd_val <= 0:
         group, pos_type = "AGGRESSIVE", "SHORT"
-    elif close >= float(r_1h["EMA20"]) and 38 <= rsi_1h <= 68 and is_funding_safe_long and is_poc_long_valid:
+    elif is_4h_long_trend and 45 <= rsi_1h <= 60 and is_funding_safe_long and is_poc_long_valid:
         group, pos_type = "STABLE", "LONG"
-    elif rsi_1h >= 58 and is_funding_safe_short and is_poc_short_valid:
+    elif is_4h_short_trend and 40 <= rsi_1h <= 55 and is_funding_safe_short and is_poc_short_valid:
         group, pos_type = "STABLE", "SHORT"
     else:
         return None
 
-    # 1. 수평 매물대 스윙 벽 스냅핑 (Burger-hyung 스타일 적용)
+    # 동적 차트 맞춤형 TP/SL 산출 (수익 극대화 가변 손익비 적용)
+    base_atr_mult = wfo_params["atr_mult"]
+    tp_mult = wfo_params["tp_extension"]
+
     if pos_type == "LONG":
-        # SL은 직전 스윙 로우 또는 POC 하단 방어선 중 더 안전한 곳 선택
-        raw_sl = close - (1.1 * atr)
+        raw_sl = close - (base_atr_mult * atr)
         sl = max(min(raw_sl, swing_low * 0.995), poc * 0.985)
         risk = close - sl
         
-        # TP는 직전 스윙 고터치 저항벽 또는 동적 ATR 목표가 중 손익비 2 이상 확보되는 최적 지점
-        raw_tp = close + (dynamic_atr_mult * atr)
-        tp = max(raw_tp, min(swing_high * 0.995, close + (risk * 2.2)))
+        # 차트 저항벽(Swing High)과 동적 ATR 목표가 중 수익이 더 극대화되는 지점으로 가변 설정
+        natural_tp = close + (tp_mult * atr)
+        tp = max(natural_tp, min(swing_high * 0.995, close + (risk * 3.2)))
     else:
-        raw_sl = close + (1.1 * atr)
+        raw_sl = close + (base_atr_mult * atr)
         sl = min(max(raw_sl, swing_high * 1.005), poc * 1.015)
         risk = sl - close
         
-        raw_tp = close - (dynamic_atr_mult * atr)
-        tp = min(raw_tp, max(swing_low * 1.005, close - (risk * 2.2)))
+        natural_tp = close - (tp_mult * atr)
+        tp = min(natural_tp, max(swing_low * 1.005, close - (risk * 3.2)))
 
-    # 손익비 검증 (Risk-Reward Ratio 2.0 미만 자동 탈락)
     reward = abs(tp - close)
     risk_val = abs(close - sl)
-    if risk_val <= 0 or (reward / risk_val) < 2.0:
+    if risk_val <= 0 or (reward / risk_val) < 1.6:
         return None
 
     risk_reward_ratio = reward / risk_val
-    sector = SECTOR_MAP.get(symbol, "Altcoin / Other")
-    score = float(np.clip(rel_vol * 15 + vol_accel * 10 + abs(relative_strength) * 10 + abs(cvd_val / 1000) * 5, 40, 100))
+    sector = SECTOR_MAP.get(symbol, "Altcoin / Liquidity Pool")
+    score = float(np.clip(rel_vol * 15 + vol_accel * 10 + abs(relative_strength) * 10, 45, 100))
     
     return {
         "symbol": symbol, "exchange": data["exchange"], "price": close, "poc": poc,
         "group": group, "pos_type": pos_type, "tp": float(tp), "sl": float(sl),
-        "rr_ratio": risk_reward_ratio, "sector": sector, "cvd": cvd_val, "score": score
+        "rr_ratio": risk_reward_ratio, "sector": sector, "score": score, "change_24h": symbol_change_24h
     }
 
 
@@ -425,67 +377,86 @@ def fmt_price(x):
 # ============================================================
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V37.0")
-    st.caption("유튜브 마스터클래스 융합 알파 엔진 (수평 매물대벽 스냅핑 + 펀딩비 방어 + 볼륨 가속도 + 동적 ATR)")
+    st.title("🚀 Crypto Quant Dashboard V39.0 Pro")
+    st.caption("동적 WFO 마켓 레짐 연동 가변형 TP/SL 수익 극대화 엔진 (상위 100대 유동성 풀 + 안전 레버리지)")
 
-    st.sidebar.header("⚙️ 비트겟 선물 API 설정")
+    st.sidebar.header("⚙️ 비트겟 선물 API 및 안전 설정")
     bitget_api_key = st.sidebar.text_input("API Key", type="password")
     bitget_secret = st.sidebar.text_input("Secret Key", type="password")
     bitget_passphrase = st.sidebar.text_input("Passphrase (비밀번호)", type="password")
     
-    auto_trade_enabled = st.sidebar.checkbox("🚀 비트겟 실전 자동 주문 활성화", value=False)
+    auto_trade_enabled = st.sidebar.checkbox("🚀 실전 자동 주문 활성화 (안전 레버리지 3배 고정)", value=False)
 
-    with st.spinner("거래소 전체 시세 및 오더플로우 데이터를 불러오는 중입니다..."):
+    with st.spinner("시장 전체 변동성 및 유동성 상위 100개 우량 종목 분석 중..."):
         market, active_exchange = fetch_tickers_safe()
 
     if market.empty:
         st.error("⚠️ 거래소 데이터 연결에 실패했습니다. 잠시 후 다시 시도해 주세요.")
         return
 
-    st.success(f"✅ 연결 성공: [{active_exchange.upper}] 마스터 데이터 연동 완료 (총 {len(market)}개 심볼)")
-    
-    wfo_params = run_walk_forward_optimization(market)
-    render_market_horizon_dashboard(market, wfo_params)
+    st.success(f"✅ 연결 성공: [{active_exchange.upper}] 마켓 연동 완료 (총 {len(market)}개 심볼)")
 
+    wfo_params = run_walk_forward_optimization(market)
+    
+    top_volume_market = market.sort_values(by="quote_volume", ascending=False).head(100)
     available_majors = [s for s in MAJOR_COINS if s in market["symbol"].values]
-    top_volatility_symbols = market.sort_values(by="change_pct", key=abs, ascending=False).head(50)["symbol"].tolist()
-    symbols = list(set(available_majors + top_volatility_symbols))
+    symbols = list(set(available_majors + top_volume_market["symbol"].tolist()))
 
     market_avg_change = float(market["change_pct"].mean())
     btc_row = market[market["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
 
-    if st.button(f"🚀 V37.0 [마스터클래스 전수 스캔] 알파 발굴 시작", use_container_width=True):
+    st.markdown(f"""
+    <div class="macro-card">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+            <h3 style="margin: 0; color: #1e293b;">🌐 V39.0 동적 WFO 마켓 분석 대시보드</h3>
+            <span style="background: #e0e7ff; color: #4f46e5; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 14px;">
+                {wfo_params['regime']}
+            </span>
+        </div>
+        <p style="font-size: 14px; color: #475569; margin-bottom: 12px;">
+            • 기계적 손익비 고정 폐지: <b>차트별 스윙 구조와 WFO 변동성에 맞춘 자율 가변 손익비(1:1.6 ~ 1:4.0+) 적용</b><br>
+            • 안전 필터: <b>당일 ±12% 이상 급등락 종목(추격 매수 위험) 차단 + 거래대금 상위 100대 우량주 한정</b>
+        </p>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+            <div class="stat-pill">₿ BTC 24H 변동률: <b>{btc_change:+.2f}%</b></div>
+            <div class="stat-pill">🎯 스캔 대상 풀: <b>우량 유동성 상위 100개</b></div>
+            <div class="stat-pill">⚡ 동적 ATR 배수: <b>{wfo_params['atr_mult']}배 적용</b></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if st.button(f"🚀 V39.0 [수익 극대화 동적 스캔] 알파 발굴 시작", use_container_width=True):
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         total_symbols = len(symbols)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(analyze_symbol_v370, s, active_exchange, market_avg_change, btc_change, wfo_params): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v390, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
                 progress_bar.progress(completed / total_symbols)
-                status_text.text(f"🔍 매물대벽 스냅핑 & 스퀴즈 방어 검증 중... ({completed}/{total_symbols}) 완료")
+                status_text.text(f"⚡ 차트 맞춤형 동적 TP/SL 및 가변 손익비 산출 중... ({completed}/{total_symbols})")
                 r = f.result()
                 if r: results.append(r)
         
         progress_bar.empty()
         status_text.empty()
-        st.session_state["v370_results"] = results
+        st.session_state["v390_results"] = results
 
-    results = st.session_state.get("v370_results", [])
+    results = st.session_state.get("v390_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
         stable_df = df_res[df_res["group"] == "STABLE"].sort_values("score", ascending=False)
 
-        st.success(f"🎉 4대 마스터 조건 및 손익비 1:2 이상을 돌파한 {len(df_res)}개의 핵심 알파 종목이 발굴되었습니다!")
+        st.success(f"🎉 차트별 최적 가변 손익비를 확보한 우량 알파 종목 {len(df_res)}개가 발굴되었습니다!")
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown(f"### 🔥 공격형 알파 트레이딩 (총 {len(agg_df)}개)")
+            st.markdown(f"### 🔥 공격형 모멘텀 (총 {len(agg_df)}개)")
             if agg_df.empty:
                 st.info("조건에 부합하는 공격형 종목이 없습니다.")
             else:
@@ -502,20 +473,20 @@ def main():
                             <div style="font-size: 13px; color: #334155;">현재가: <b>{fmt_price(row['price'])}</b></div>
                         </div>
                         <div class="tpsl-box">
-                            🎯 <b>매물대 스냅 익절가(TP):</b> <span style="color: {tp_color}; font-size: 15px; font-weight: 800;">{fmt_price(row['tp'])}</span><br>
-                            🛑 <b>방어 손절가(SL):</b> <span style="color: #475569; font-size: 14px; font-weight: 700;">{fmt_price(row['sl'])}</span><br>
-                            ⚖️ <b>검증된 손익비(RR):</b> <span style="color: #4f46e5; font-weight: 700;">1 : {row['rr_ratio']:.2f}</span>
+                            🎯 <b>동적 목표 익절가(TP):</b> <span style="color: {tp_color}; font-size: 15px; font-weight: 800;">{fmt_price(row['tp'])}</span><br>
+                            🛑 <b>변동성 방어 손절가(SL):</b> <span style="color: #475569; font-size: 14px; font-weight: 700;">{fmt_price(row['sl'])}</span><br>
+                            ⚖️ <b>차트 맞춤 가변 손익비(RR):</b> <span style="color: #4f46e5; font-weight: 700;">1 : {row['rr_ratio']:.2f}</span>
                         </div>
                         <div style="margin-top: 8px; font-size: 12px; color: #64748b;">
-                            🏷️ 섹터: <b>{row['sector']}</b> | 마스터스코어: <b style="color: #4f46e5;">{row['score']:.1f}점</b>
+                            🏷️ 섹터: <b>{row['sector']}</b> | 24H 변동: <b>{row['change_24h']:+.2f}%</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
 
                     btn_key = f"btn_agg_{row['symbol']}"
-                    if st.button(f"⚡ [{row['symbol']}] 최대레버리지 & 마스터 OCO 자동주문", key=btn_key):
+                    if st.button(f"⚡ [{row['symbol']}] 안전 3배 레버리지 OCO 자동주문", key=btn_key):
                         if not auto_trade_enabled:
-                            st.warning("사이드바에서 '비트겟 실전 자동 주문 활성화'를 체크해주세요.")
+                            st.warning("사이드바에서 '실전 자동 주문 활성화'를 체크해주세요.")
                         elif not bitget_api_key or not bitget_secret or not bitget_passphrase:
                             st.error("사이드바에 비트겟 API Key, Secret, Passphrase를 모두 입력해주세요.")
                         else:
@@ -530,7 +501,7 @@ def main():
                                     st.error(f"❌ 주문 실패: {msg}")
 
         with col2:
-            st.markdown(f"### 🛡️ 안정형 스윙 트레이딩 (총 {len(stable_df)}개)")
+            st.markdown(f"### 🛡️ 안정형 스윙 (총 {len(stable_df)}개)")
             if stable_df.empty:
                 st.info("조건에 부합하는 안정형 종목이 없습니다.")
             else:
@@ -547,20 +518,20 @@ def main():
                             <div style="font-size: 13px; color: #334155;">현재가: <b>{fmt_price(row['price'])}</b></div>
                         </div>
                         <div class="tpsl-box">
-                            🎯 <b>매물대 스냅 익절가(TP):</b> <span style="color: {tp_color}; font-size: 15px; font-weight: 800;">{fmt_price(row['tp'])}</span><br>
-                            🛑 <b>방어 손절가(SL):</b> <span style="color: #475569; font-size: 14px; font-weight: 700;">{fmt_price(row['sl'])}</span><br>
-                            ⚖️ <b>검증된 손익비(RR):</b> <span style="color: #4f46e5; font-weight: 700;">1 : {row['rr_ratio']:.2f}</span>
+                            🎯 <b>동적 목표 익절가(TP):</b> <span style="color: {tp_color}; font-size: 15px; font-weight: 800;">{fmt_price(row['tp'])}</span><br>
+                            🛑 <b>변동성 방어 손절가(SL):</b> <span style="color: #475569; font-size: 14px; font-weight: 700;">{fmt_price(row['sl'])}</span><br>
+                            ⚖️ <b>차트 맞춤 가변 손익비(RR):</b> <span style="color: #4f46e5; font-weight: 700;">1 : {row['rr_ratio']:.2f}</span>
                         </div>
                         <div style="margin-top: 8px; font-size: 12px; color: #64748b;">
-                            🏷️ 섹터: <b>{row['sector']}</b> | 마스터스코어: <b style="color: #4f46e5;">{row['score']:.1f}점</b>
+                            🏷️ 섹터: <b>{row['sector']}</b> | 24H 변동: <b>{row['change_24h']:+.2f}%</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
 
                     btn_key = f"btn_stable_{row['symbol']}"
-                    if st.button(f"⚡ [{row['symbol']}] 최대레버리지 & 마스터 OCO 자동주문", key=btn_key):
+                    if st.button(f"⚡ [{row['symbol']}] 안전 3배 레버리지 OCO 자동주문", key=btn_key):
                         if not auto_trade_enabled:
-                            st.warning("사이드바에서 '비트겟 실전 자동 주문 활성화'를 체크해주세요.")
+                            st.warning("사이드바에서 '실전 자동 주문 활성화'를 체크해주세요.")
                         elif not bitget_api_key or not bitget_secret or not bitget_passphrase:
                             st.error("사이드바에 비트겟 API Key, Secret, Passphrase를 모두 입력해주세요.")
                         else:
