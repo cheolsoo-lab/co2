@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V32 (Full Exchange Universe Scan + Multi-Timeframe WFO Engine)
-- Scans ALL USDT Perpetual Swap Symbols on Exchange
+Crypto Quant Dashboard V33 (Enhanced TP/SL Readability & Full Exchange Universe Scan)
 - Multi-Timeframe Confluence (1D Trend + 4H Swing + 1H/15m Precise Entry)
+- Dynamic WFO Regime Optimization & Alpha RS Scoring
 - Bitget Auto Futures Order: Max Leverage + 1% Asset Risk + TP/SL OCO Execution
 """
 
@@ -18,11 +18,11 @@ import streamlit as st
 import ta
 
 # ============================================================
-# 0. APP CONFIG & STYLING
+# 0. APP CONFIG & STYLING (TP/SL 가독성 대폭 향상)
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V32",
+    page_title="🔥 Crypto Quant Dashboard V33",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -41,23 +41,34 @@ st.markdown("""
     }
     .card-agg-long {
         background: #f0fdf4; border: 1px solid #bbf7d0; border-left: 5px solid #10b981;
-        padding: 14px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        padding: 16px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
     }
     .card-agg-short {
         background: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #ef4444;
-        padding: 14px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        padding: 16px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
     }
     .card-stable-long {
         background: #f0fdf4; border: 1px solid #d1fae5; border-left: 5px solid #059669;
-        padding: 14px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        padding: 16px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
     }
     .card-stable-short {
         background: #fff1f2; border: 1px solid #fecdd3; border-left: 5px solid #e11d48;
-        padding: 14px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
+        padding: 16px; border-radius: 8px; margin-bottom: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.02);
     }
-    .badge-long { background-color: #10b981; color: white; padding: 3px 8px; border-radius: 4px; font-weight: 700; font-size: 11px; }
-    .badge-short { background-color: #ef4444; color: white; padding: 3px 8px; border-radius: 4px; font-weight: 700; font-size: 11px; }
+    .badge-long { background-color: #10b981; color: white; padding: 4px 10px; border-radius: 4px; font-weight: 700; font-size: 12px; }
+    .badge-short { background-color: #ef4444; color: white; padding: 4px 10px; border-radius: 4px; font-weight: 700; font-size: 12px; }
     .stat-pill { background: #f1f5f9; padding: 8px 12px; border-radius: 8px; font-weight: 600; font-size: 13px; color: #475569; text-align: center; }
+    
+    /* 🛑 TP / SL 가격 글자 크기 및 가독성 강조 스타일 */
+    .tpsl-box {
+        margin-top: 10px;
+        font-size: 14px;
+        color: #1e293b;
+        background: #ffffff;
+        padding: 10px 12px;
+        border-radius: 6px;
+        border: 1px solid #e2e8f0;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -296,7 +307,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
     st.divider()
 
 
-def analyze_symbol_v32(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
+def analyze_symbol_v33(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
     data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
     if not data:
         return None
@@ -382,8 +393,8 @@ def fmt_price(x):
 # ============================================================
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V32")
-    st.caption("거래소 전체 코인 전수 조사 스캔 + WFO 수익 극대화 엔진 + 비트겟 최대레버리지 & 1% 자산 자동매매")
+    st.title("🔥 Crypto Quant Dashboard V33")
+    st.caption("전체 코인 전수 조사 + TP/SL 가독성 극대화 + WFO 수익 극대화 엔진 + 비트겟 자동매매")
 
     st.sidebar.header("⚙️ 비트겟 선물 API 설정")
     bitget_api_key = st.sidebar.text_input("API Key", type="password")
@@ -404,7 +415,6 @@ def main():
     wfo_params = run_walk_forward_optimization(market)
     render_market_horizon_dashboard(market, wfo_params)
 
-    # 🛑 Top 50 제한 해제 -> 전체 코인 유니버스 전수 조사 반영
     symbols = market["symbol"].tolist()
     market_avg_change = float(market["change_pct"].mean())
 
@@ -414,9 +424,8 @@ def main():
         status_text = st.empty()
         total_symbols = len(symbols)
         
-        # 병렬 처리 워커 수 대폭 확대로 고속 전수 조사
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(analyze_symbol_v32, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v33, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -427,9 +436,9 @@ def main():
         
         progress_bar.empty()
         status_text.empty()
-        st.session_state["v32_results"] = results
+        st.session_state["v33_results"] = results
 
-    results = st.session_state.get("v32_results", [])
+    results = st.session_state.get("v33_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
@@ -447,17 +456,21 @@ def main():
                     is_long = row["pos_type"] == "LONG"
                     card_cls = "card-agg-long" if is_long else "card-agg-short"
                     badge_html = '<span class="badge-long">🟢 AGG LONG</span>' if is_long else '<span class="badge-short">🔴 AGG SHORT</span>'
-                    tp_color = "#10b981" if is_long else "#ef4444"
+                    tp_color = "#047857" if is_long else "#dc2626"
 
+                    # 🛑 TP/SL 글자 크기(15px, 굵게)와 가독성을 대폭 키운 HTML 카드 템플릿
                     st.markdown(f"""
                     <div class="{card_cls}">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>{badge_html} &nbsp; <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b></div>
-                            <div style="font-size: 12px; color: #334155;"><b>{fmt_price(row['price'])}</b></div>
+                            <div>{badge_html} &nbsp; <b style="font-size: 16px; color: #0f172a;">{row['symbol']}</b></div>
+                            <div style="font-size: 13px; color: #334155;">현재가: <b>{fmt_price(row['price'])}</b></div>
                         </div>
-                        <div style="margin-top: 8px; font-size: 11px; color: #475569; background: #ffffff; padding: 8px; border-radius: 6px;">
-                            🎯 TP: <code style="color: {tp_color}; font-weight:700;">{fmt_price(row['tp'])}</code> | 🛑 SL: <code style="color: #64748b; font-weight:700;">{fmt_price(row['sl'])}</code><br>
-                            📊 4H RSI: {row['rsi_4h']:.1f} | 1H RSI: {row['rsi_1h']:.1f} | 수급 볼륨: {row['rel_vol']:.1f}배 | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
+                        <div class="tpsl-box">
+                            🎯 <b>익절가(TP):</b> <span style="color: {tp_color}; font-size: 15px; font-weight: 800;">{fmt_price(row['tp'])}</span><br>
+                            🛑 <b>손절가(SL):</b> <span style="color: #475569; font-size: 15px; font-weight: 800;">{fmt_price(row['sl'])}</span>
+                        </div>
+                        <div style="margin-top: 8px; font-size: 12px; color: #64748b;">
+                            📊 4H RSI: {row['rsi_4h']:.1f} | 1H RSI: {row['rsi_1h']:.1f} | 볼륨: {row['rel_vol']:.1f}배 | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f점}</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -488,17 +501,20 @@ def main():
                     is_long = row["pos_type"] == "LONG"
                     card_cls = "card-stable-long" if is_long else "card-stable-short"
                     badge_html = '<span class="badge-long">🟢 STABLE LONG</span>' if is_long else '<span class="badge-short">🔴 STABLE SHORT</span>'
-                    tp_color = "#10b981" if is_long else "#e11d48"
+                    tp_color = "#047857" if is_long else "#dc2626"
 
                     st.markdown(f"""
                     <div class="{card_cls}">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>{badge_html} &nbsp; <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b></div>
-                            <div style="font-size: 12px; color: #334155;"><b>{fmt_price(row['price'])}</b></div>
+                            <div>{badge_html} &nbsp; <b style="font-size: 16px; color: #0f172a;">{row['symbol']}</b></div>
+                            <div style="font-size: 13px; color: #334155;">현재가: <b>{fmt_price(row['price'])}</b></div>
                         </div>
-                        <div style="margin-top: 8px; font-size: 11px; color: #475569; background: #ffffff; padding: 8px; border-radius: 6px;">
-                            🎯 TP: <code style="color: {tp_color}; font-weight:700;">{fmt_price(row['tp'])}</code> | 🛑 SL: <code style="color: #64748b; font-weight:700;">{fmt_price(row['sl'])}</code><br>
-                            📊 4H RSI: {row['rsi_4h']:.1f} | 1H RSI: {row['rsi_1h']:.1f} | 수급 볼륨: {row['rel_vol']:.1f}배 | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
+                        <div class="tpsl-box">
+                            🎯 <b>익절가(TP):</b> <span style="color: {tp_color}; font-size: 15px; font-weight: 800;">{fmt_price(row['tp'])}</span><br>
+                            🛑 <b>손절가(SL):</b> <span style="color: #475569; font-size: 15px; font-weight: 800;">{fmt_price(row['sl'])}</span>
+                        </div>
+                        <div style="margin-top: 8px; font-size: 12px; color: #64748b;">
+                            📊 4H RSI: {row['rsi_4h']:.1f} | 1H RSI: {row['rsi_1h']:.1f} | 볼륨: {row['rel_vol']:.1f}배 | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
