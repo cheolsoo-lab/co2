@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V20 (Ultimate 50-Coin Expansion & Hybrid TP/SL)
-- Expanded Universe: Top 50 Coins by Volume
-- Hybrid TP/SL Engine: ATR/Swing Dynamic + Safe Percentage Boundary Caps
-- Multi-Timeframe (1D + 4H) + Orderflow (OI/Funding) + Relative Strength (RS)
+Crypto Quant Dashboard V21 (Robust Data Fetching & Hybrid TP/SL)
+- Enhanced Exception Handling & Fallback for CCXT API
+- Expanded Universe: Top 50 Coins by Volume with Safe Parsing
+- Multi-Timeframe (1D + 4H) + Orderflow + RS
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V20",
+    page_title="🔥 Crypto Quant Dashboard V21",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -57,11 +57,11 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DEFAULT_EXCHANGES = ["binance", "bybit"]
+DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
 
 
 # ============================================================
-# 1. DATA ACCESS & ENGINE
+# 1. ROBUST DATA ACCESS & ENGINE
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -69,67 +69,86 @@ def make_exchange(exchange_id: str):
     cls = getattr(ccxt, exchange_id)
     return cls({
         "enableRateLimit": True,
-        "timeout": 15000,
+        "timeout": 20000,
         "options": {"defaultType": "swap"},
     })
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_tickers_with_fallback() -> tuple[pd.DataFrame, str]:
+def fetch_tickers_safe() -> tuple[pd.DataFrame, str]:
+    """거래소별로 순차 접근하여 차단이나 타임아웃 시 대체 거래소로 자동 우회"""
     for exchange_id in DEFAULT_EXCHANGES:
         try:
             ex = make_exchange(exchange_id)
+            ex.load_markets()
             tickers = ex.fetch_tickers()
             rows = []
             for symbol, t in tickers.items():
-                if not symbol.endswith("/USDT:USDT") and not symbol.endswith("/USDT"):
+                # USDT 페어만 필터링
+                if not symbol.endswith("USDT") and not "/USDT" in symbol:
                     continue
+                
                 clean_symbol = symbol.split(":")[0] if ":" in symbol else symbol
+                if not clean_symbol.endswith("/USDT"):
+                    # 예: BTCUSDT 형태인 경우 변환
+                    if clean_symbol.endswith("USDT") and "/" not in clean_symbol:
+                        base = clean_symbol[:-4]
+                        clean_symbol = f"{base}/USDT"
+                    else:
+                        continue
+
                 last = t.get("last")
-                quote_volume = t.get("quoteVolume")
+                quote_volume = t.get("quoteVolume") or t.get("baseVolume") or 0.0
                 pct = t.get("percentage")
+                
                 if last is None:
                     continue
+                
                 rows.append({
                     "symbol": clean_symbol,
                     "base": clean_symbol.split("/")[0],
                     "last": float(last),
-                    "change_pct": float(pct) if pct is not None else np.nan,
+                    "change_pct": float(pct) if pct is not None else 0.0,
                     "quote_volume": float(quote_volume) if quote_volume is not None else 0.0,
                 })
+            
             df = pd.DataFrame(rows).drop_duplicates("symbol")
             if not df.empty:
                 return df, exchange_id
-        except Exception:
+        except Exception as e:
+            print(f"[{exchange_id}] fetch_tickers error: {e}")
             continue
+            
     return pd.DataFrame(), ""
 
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
-    ex = make_exchange(exchange_id)
-    raw_symbol = f"{symbol}:USDT" if exchange_id == "binance" else symbol
-    
     try:
-        raw_1d = ex.fetch_ohlcv(raw_symbol, timeframe="1d", limit=150)
+        ex = make_exchange(exchange_id)
+        # 바이낸스 등 선물 심볼 포맷 맞춤
+        raw_symbol = symbol if exchange_id != "binance" else f"{symbol.replace('/','')} :USDT" if ":" not in symbol else symbol
+        if exchange_id == "binance" and ":" not in raw_symbol:
+            raw_symbol = f"{symbol.split('/')[0]}/USDT:USDT"
+
+        raw_1d = ex.fetch_ohlcv(raw_symbol, timeframe="1d", limit=100)
         df_1d = pd.DataFrame(raw_1d, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         df_1d["EMA20"] = ta.trend.EMAIndicator(df_1d["Close"], window=20).ema_indicator()
         df_1d["RSI14"] = ta.momentum.RSIIndicator(df_1d["Close"], window=14).rsi()
 
-        raw_4h = ex.fetch_ohlcv(raw_symbol, timeframe="4h", limit=150)
+        raw_4h = ex.fetch_ohlcv(raw_symbol, timeframe="4h", limit=100)
         df_4h = pd.DataFrame(raw_4h, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         df_4h["EMA20"] = ta.trend.EMAIndicator(df_4h["Close"], window=20).ema_indicator()
         df_4h["RSI14"] = ta.momentum.RSIIndicator(df_4h["Close"], window=14).rsi()
         df_4h["ATR14"] = ta.volatility.AverageTrueRange(df_4h["High"], df_4h["Low"], df_4h["Close"], window=14).average_true_range()
         df_4h["VOL_MA20"] = df_4h["Volume"].rolling(20).mean()
         df_4h["REL_VOLUME"] = df_4h["Volume"] / df_4h["VOL_MA20"]
-        df_4h["SWING_HIGH"] = df_4h["High"].rolling(12, center=False).max().shift(1)
-        df_4h["SWING_LOW"] = df_4h["Low"].rolling(12, center=False).min().shift(1)
 
         oi_change, funding_rate = 1.0, 0.0
         try:
             oi_data = ex.fetch_open_interest(raw_symbol)
-            if oi_data.get("openInterestAmount", 0) > 0: oi_change = 1.2
+            if oi_data.get("openInterestAmount", 0) > 0: 
+                oi_change = 1.2
         except Exception:
             pass
 
@@ -139,7 +158,7 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         except Exception:
             pass
 
-        if len(df_1d) < 50 or len(df_4h) < 50:
+        if len(df_1d) < 30 or len(df_4h) < 30:
             return None
 
         return {
@@ -158,9 +177,9 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
     avg_change = market_df["change_pct"].mean()
 
-    if btc_change > 1.5 and avg_change > 0.8:
+    if btc_change > 1.5 and avg_change > 0.5:
         phase = "🚀 강한 상승장 (Risk-On)"
-    elif btc_change < -1.5 or avg_change < -1.0:
+    elif btc_change < -1.5 or avg_change < -0.8:
         phase = "🩸 하락 추세 (Risk-Off)"
     else:
         phase = "⚖️ 혼조세 및 횡보장"
@@ -175,7 +194,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
         </div>
         <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
             <div class="stat-pill">₿ BTC 24H: <b>{btc_change:+.2f}%</b></div>
-            <div class="stat-pill">🔍 스캔 유니버스: <b>상위 50개 알트·메이저 종목</b></div>
+            <div class="stat-pill">🔍 스캔 유니버스: <b>상위 50개 알트·메이저 종목 (연결 거래소 자동 최적화)</b></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -183,75 +202,73 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
 
 
 # ============================================================
-# 2. HYBRID TP/SL & QUANT ANALYSIS ENGINE (V20)
+# 2. HYBRID TP/SL & QUANT ANALYSIS ENGINE (V21)
 # ============================================================
 
-def analyze_symbol_v20(symbol: str, market_avg_change: float) -> Optional[dict]:
-    for ex_id in DEFAULT_EXCHANGES:
-        data = fetch_multi_timeframe_data(ex_id, symbol)
-        if not data:
-            continue
-        
-        df_1d = data["df_1d"]
-        df_4h = data["df_4h"]
-        funding_rate = data["funding_rate"]
+def analyze_symbol_v21(symbol: str, exchange_id: str, market_avg_change: float) -> Optional[dict]:
+    data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
+    if not data:
+        return None
+    
+    df_1d = data["df_1d"]
+    df_4h = data["df_4h"]
+    funding_rate = data["funding_rate"]
 
-        r_1d = df_1d.iloc[-1]
-        r_4h = df_4h.iloc[-1]
+    r_1d = df_1d.iloc[-1]
+    r_4h = df_4h.iloc[-1]
 
-        close = float(r_4h["Close"])
-        atr = float(r_4h["ATR14"]) if pd.notna(r_4h["ATR14"]) else close * 0.03
-        rsi_4h = float(r_4h["RSI14"])
-        rel_vol = float(r_4h["REL_VOLUME"]) if pd.notna(r_4h["REL_VOLUME"]) else 1.0
-        
+    close = float(r_4h["Close"])
+    atr = float(r_4h["ATR14"]) if pd.notna(r_4h["ATR14"]) else close * 0.03
+    rsi_4h = float(r_4h["RSI14"])
+    rel_vol = float(r_4h["REL_VOLUME"]) if pd.notna(r_4h["REL_VOLUME"]) else 1.0
+    
+    if len(df_4h) >= 6:
         symbol_change_24h = float((close - df_4h.iloc[-6]["Close"]) / df_4h.iloc[-6]["Close"] * 100)
-        relative_strength = symbol_change_24h - market_avg_change
+    else:
+        symbol_change_24h = 0.0
+        
+    relative_strength = symbol_change_24h - market_avg_change
 
-        group, pos_type = None, None
+    group, pos_type = None, None
 
-        # 조건 판별
-        if r_1d["Close"] > r_1d["EMA20"] and rel_vol >= 1.5 and relative_strength > 0.8 and rsi_4h < 75:
-            group, pos_type = "AGGRESSIVE", "LONG"
-        elif r_1d["Close"] < r_1d["EMA20"] and rel_vol >= 1.5 and relative_strength < -0.8 and rsi_4h > 25:
-            group, pos_type = "AGGRESSIVE", "SHORT"
-        elif r_1d["Close"] >= r_1d["EMA20"] and close >= float(r_4h["EMA20"]) and 40 <= rsi_4h <= 60 and funding_rate <= 0.0006:
-            group, pos_type = "STABLE", "LONG"
-        elif r_1d["Close"] < r_1d["EMA20"] and rsi_4h >= 65 and funding_rate >= 0.0008:
-            group, pos_type = "STABLE", "SHORT"
-        else:
-            continue
+    # 조건 판별 로직
+    if r_1d["Close"] > r_1d["EMA20"] and rel_vol >= 1.3 and relative_strength > 0.5 and rsi_4h < 75:
+        group, pos_type = "AGGRESSIVE", "LONG"
+    elif r_1d["Close"] < r_1d["EMA20"] and rel_vol >= 1.3 and relative_strength < -0.5 and rsi_4h > 25:
+        group, pos_type = "AGGRESSIVE", "SHORT"
+    elif r_1d["Close"] >= r_1d["EMA20"] and close >= float(r_4h["EMA20"]) and 40 <= rsi_4h <= 65 and funding_rate <= 0.0008:
+        group, pos_type = "STABLE", "LONG"
+    elif r_1d["Close"] < r_1d["EMA20"] and rsi_4h >= 60 and funding_rate >= 0.0006:
+        group, pos_type = "STABLE", "SHORT"
+    else:
+        return None
 
-        # 🎯 하이브리드 TP/SL 산출 (ATR 변동성 반영 + 안전 퍼센트 캡 적용으로 비정상 가격 방지)
-        if pos_type == "LONG":
-            # TP: ATR 기반 목표가와 고정 +4%~+6% 사이를 조화 (최대 7% 안넘게 캡)
-            raw_tp = close + (2.5 * atr)
-            cap_tp = close * 1.05
-            tp = min(raw_tp, cap_tp)
-            
-            # SL: ATR 기반 손절가와 고정 -1.8%~-2.5% 사이 캡
-            raw_sl = close - (1.2 * atr)
-            floor_sl = close * 0.982
-            sl = max(raw_sl, floor_sl)
-        else:
-            # SHORT
-            raw_tp = close - (2.5 * atr)
-            cap_tp = close * 0.95
-            tp = max(raw_tp, cap_tp)
-            
-            raw_sl = close + (1.2 * atr)
-            floor_sl = close * 1.018
-            sl = min(raw_sl, floor_sl)
+    # 🎯 하이브리드 TP/SL 산출 (안전 캡 적용)
+    if pos_type == "LONG":
+        raw_tp = close + (2.2 * atr)
+        cap_tp = close * 1.05
+        tp = min(raw_tp, cap_tp)
+        
+        raw_sl = close - (1.1 * atr)
+        floor_sl = close * 0.98
+        sl = max(raw_sl, floor_sl)
+    else:
+        raw_tp = close - (2.2 * atr)
+        cap_tp = close * 0.95
+        tp = max(raw_tp, cap_tp)
+        
+        raw_sl = close + (1.1 * atr)
+        floor_sl = close * 1.02
+        sl = min(raw_sl, floor_sl)
 
-        score = float(np.clip(rel_vol * 20 + abs(relative_strength) * 10 + (50 - abs(rsi_4h - 50)), 40, 100))
-        allocation = 15.0
-
-        return {
-            "symbol": symbol, "exchange": data["exchange"], "price": close,
-            "group": group, "pos_type": pos_type, "tp": tp, "sl": sl,
-            "rsi": rsi_4h, "rel_vol": rel_vol, "rs": relative_strength,
-            "score": score, "allocation": allocation
-        }
-    return None
+    score = float(np.clip(rel_vol * 20 + abs(relative_strength) * 10 + (50 - abs(rsi_4h - 50)), 40, 100))
+    
+    return {
+        "symbol": symbol, "exchange": data["exchange"], "price": close,
+        "group": group, "pos_type": pos_type, "tp": tp, "sl": sl,
+        "rsi": rsi_4h, "rel_vol": rel_vol, "rs": relative_strength,
+        "score": score, "allocation": 15.0
+    }
 
 
 # ============================================================
@@ -265,31 +282,42 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V20")
-    st.caption("Top 50 코인 확장 및 ATR 변동성 + 안전 퍼센트 캡이 결합된 하이브리드 TP/SL 시스템")
+    st.title("🔥 Crypto Quant Dashboard V21")
+    st.caption("네트워크 자동 우회 및 Top 50 코인 안정화 스캐너")
 
-    market, active_exchange = fetch_tickers_with_fallback()
+    with st.spinner("거래소 시세 데이터를 안전하게 불러오는 중입니다..."):
+        market, active_exchange = fetch_tickers_safe()
+
     if market.empty:
-        st.error("시세 데이터를 불러오지 못했습니다.")
+        st.error("⚠️ 모든 거래소(Binance, Bybit, OKX) 연결이 지연되었거나 차단되었습니다. 잠시 후 다시 시도해 주세요.")
         return
 
+    st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 데이터 연동 완료 (총 {len(market)}개 심볼 감지)")
     render_market_horizon_dashboard(market)
 
-    # 상위 50개 코인으로 유니버스 확장
-    universe = market[market["quote_volume"] >= 1_000_000].sort_values("quote_volume", ascending=False).head(50)
+    universe = market.sort_values("quote_volume", ascending=False).head(50)
     symbols = universe["symbol"].tolist()
     market_avg_change = float(market["change_pct"].mean())
 
     if st.button("🚀 Top 50 종목 하이브리드 퀀트 스캔 실행", use_container_width=True):
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(analyze_symbol_v20, s, market_avg_change) for s in symbols]
+        progress_bar = st.progress(0)
+        total_symbols = len(symbols)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(analyze_symbol_v21, s, active_exchange, market_avg_change): s for s in symbols}
+            completed = 0
             for f in concurrent.futures.as_completed(futures):
+                completed += 1
+                progress_bar.progress(completed / total_symbols)
                 r = f.result()
-                if r: results.append(r)
-        st.session_state["v20_results"] = results
+                if r: 
+                    results.append(r)
+        
+        progress_bar.empty()
+        st.session_state["v21_results"] = results
 
-    results = st.session_state.get("v20_results", [])
+    results = st.session_state.get("v21_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
@@ -298,7 +326,7 @@ def main():
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### 🔥 공격형 알파 트레이딩 (Top 50 돌파)")
+            st.markdown("### 🔥 공격형 알파 트레이딩 (돌파)")
             if agg_df.empty:
                 st.info("조건에 부합하는 공격형 종목이 없습니다.")
             else:
@@ -322,7 +350,7 @@ def main():
                     """, unsafe_allow_html=True)
 
         with col2:
-            st.markdown("### 🛡️ 안정형 스윙 트레이딩 (Top 50 눌림목)")
+            st.markdown("### 🛡️ 안정형 스윙 트레이딩 (눌림목)")
             if stable_df.empty:
                 st.info("조건에 부합하는 안정형 종목이 없습니다.")
             else:
