@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V16 (Long/Short Visual Clarity)
+Crypto Quant Dashboard V17 (Aggressive/Stable Long & Short Split)
 - Clean Light UI Design
-- Clear LONG (Green) & SHORT (Red) Badge & Color Coding
+- 3-Way Classification: Aggressive Long, Stable Long, Short
 - Swing High/Low Dynamic TP/SL Engine
 """
 
@@ -22,8 +22,8 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V16",
-    page_icon="🚀",
+    page_title="🔥 Crypto Quant Dashboard V17",
+    page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
@@ -35,20 +35,27 @@ st.markdown("""
         background: #ffffff; border: 1px solid #e2e8f0; border-left: 6px solid #3b82f6;
         padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); margin-bottom: 20px;
     }
-    /* 🟢 LONG 포지션 카드 스타일 (초록/그린 계열) */
-    .coin-card-long {
+    /* 🚀 공격형 롱 카드 (주황/레드 계열 핫 모멘텀) */
+    .card-agg-long {
+        background: #fff1f2; border: 1px solid #fecdd3; border-left: 5px solid #e11d48;
+        padding: 15px; border-radius: 10px; margin-bottom: 12px;
+        box-shadow: 0 2px 4px rgba(225, 29, 72, 0.05);
+    }
+    /* 🛡️ 안정형 롱 카드 (초록 계열 눌림목) */
+    .card-stable-long {
         background: #f0fdf4; border: 1px solid #bbf7d0; border-left: 5px solid #10b981;
         padding: 15px; border-radius: 10px; margin-bottom: 12px;
-        box-shadow: 0 2px 4px rgba(16, 185, 129, 0.06);
+        box-shadow: 0 2px 4px rgba(16, 185, 129, 0.05);
     }
-    /* 🔴 SHORT 포지션 카드 스타일 (빨강/레드 계열) */
-    .coin-card-short {
-        background: #fff5f5; border: 1px solid #fed7d7; border-left: 5px solid #ef4444;
+    /* 🔴 숏 카드 (진한 레드 계열 하방 베팅) */
+    .card-short {
+        background: #fef2f2; border: 1px solid #fecaca; border-left: 5px solid #dc2626;
         padding: 15px; border-radius: 10px; margin-bottom: 12px;
-        box-shadow: 0 2px 4px rgba(239, 68, 68, 0.06);
+        box-shadow: 0 2px 4px rgba(220, 38, 38, 0.05);
     }
-    .badge-long { background-color: #10b981; color: white; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; }
-    .badge-short { background-color: #ef4444; color: white; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 12px; }
+    .badge-agg { background-color: #e11d48; color: white; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; }
+    .badge-stable { background-color: #10b981; color: white; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; }
+    .badge-short { background-color: #dc2626; color: white; padding: 4px 10px; border-radius: 6px; font-weight: 700; font-size: 11px; }
     .stat-pill { background: #f1f5f9; padding: 8px 12px; border-radius: 8px; font-weight: 600; font-size: 13px; color: #475569; text-align: center; }
 </style>
 """, unsafe_allow_html=True)
@@ -57,7 +64,7 @@ DEFAULT_EXCHANGES = ["binance", "bybit", "mexc", "gateio"]
 
 
 # ============================================================
-# 1. DATA ACCESS & ADVANCED MACRO ENGINE
+# 1. DATA ACCESS & MACRO ENGINE
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -152,16 +159,16 @@ def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
 
     if btc_dom < 48.0 and alt_share > 45.0 and avg_change > 0.5:
         phase = "🚀 대세 알트 불장"
-        action_guide = "롱(LONG) 포지션 위주 트레이딩 강력 추천"
+        action_guide = "공격형 및 안정형 롱(LONG) 포지션 위주 트레이딩 권장"
     elif btc_dom >= 52.0 and btc_change > 1.0:
         phase = "⚡ 비트코인 독주장"
-        action_guide = "비트코인 롱 및 메이저 중심 대응"
+        action_guide = "비트코인 및 메이저 롱 포지션 집중"
     elif btc_change < -1.5 or avg_change < -1.0:
         phase = "🩸 하락 추세 (Risk-Off)"
-        action_guide = "숏(SHORT) 베팅 또는 현금 방어 우선"
+        action_guide = "숏(SHORT) 베팅 및 현금 방어 우선"
     else:
         phase = "⚖️ 박스권 횡보장"
-        action_guide = "지지선 롱 / 저항선 숏 양방향 스윙 대응"
+        action_guide = "안정형 롱 및 저항선 숏 양방향 균형 대응"
 
     return {
         "phase": phase, "action_guide": action_guide,
@@ -174,13 +181,13 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
     st.markdown(f"""
     <div class="macro-card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-            <h3 style="margin: 0; color: #1e293b;">🌐 시장 거시 진단 및 포지션 가이드</h3>
+            <h3 style="margin: 0; color: #1e293b;">🌐 시장 거시 진단 및 전략 가이드</h3>
             <span style="background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 14px;">
                 {m['phase']}
             </span>
         </div>
         <p style="font-size: 16px; font-weight: 600; color: #0f172a; margin-bottom: 15px;">
-            💡 전략 권고: <span style="color: #2563eb;">{m['action_guide']}</span>
+            💡 전략 가이드: <span style="color: #2563eb;">{m['action_guide']}</span>
         </p>
         <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 12px 0;">
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
@@ -194,10 +201,10 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
 
 
 # ============================================================
-# 2. ADVANCED SYMBOL ANALYSIS (LONG / SHORT CLASSIFICATION)
+# 2. 3-WAY STRATEGY ANALYSIS (Aggressive Long / Stable Long / Short)
 # ============================================================
 
-def analyze_symbol_v16(symbol: str) -> Optional[dict]:
+def analyze_symbol_v17(symbol: str) -> Optional[dict]:
     try:
         df, ex_id = fetch_ohlcv_fallback(symbol, "1d", 200)
         if len(df) < 100:
@@ -213,18 +220,25 @@ def analyze_symbol_v16(symbol: str) -> Optional[dict]:
         swing_high = float(r["SWING_HIGH"]) if pd.notna(r["SWING_HIGH"]) else close + (3.0 * atr)
         swing_low = float(r["SWING_LOW"]) if pd.notna(r["SWING_LOW"]) else close - (1.5 * atr)
 
-        # 🟢 1. LONG 조건 (상승 돌파 또는 이평선 지지 반등)
-        if (rel_vol >= 1.6 and change_24h > 1.5 and rsi < 75) or (close >= float(r["EMA20"]) and 42 <= rsi <= 62):
-            position_type = "LONG"
+        # 1. 🔥 공격형 롱 (고수익 돌파 모멘텀)
+        if rel_vol >= 1.8 and change_24h > 2.0 and rsi < 75:
+            strategy_type = "AGGRESSIVE_LONG"
             tp = min(swing_high, close + (3.5 * atr))
             sl = max(swing_low, close - (1.2 * atr))
-            score = float(np.clip(rel_vol * 20 + change_24h * 5, 50, 100))
-        
-        # 🔴 2. SHORT 조건 (과매수 상태에서 거래량 동반 이탈 혹은 저항선 맞고 하락)
-        elif (rsi >= 68 and change_24h < 0.5) or (close < float(r["EMA20"]) and rsi < 45 and rel_vol >= 1.4):
-            position_type = "SHORT"
-            tp = max(swing_low, close - (3.0 * atr))  # 숏의 목표가(익절가)는 아래쪽
-            sl = min(swing_high, close + (1.2 * atr)) # 숏의 손절가는 위쪽 저항선
+            score = float(np.clip(rel_vol * 25 + change_24h * 5, 50, 100))
+
+        # 2. 🛡️ 안정형 롱 (이평선 눌림목 반등)
+        elif close >= float(r["EMA20"]) and 40 <= rsi <= 62:
+            strategy_type = "STABLE_LONG"
+            tp = min(swing_high, close + (3.0 * atr))
+            sl = max(swing_low, close - (1.0 * atr))
+            score = float(np.clip((62 - abs(rsi - 50)) * 1.5 + rel_vol * 15, 40, 95))
+
+        # 3. 🔴 숏 베팅 (과매수 이탈 또는 하방 압력 우세)
+        elif (rsi >= 68 and change_24h < 1.0) or (close < float(r["EMA20"]) and rsi < 45 and rel_vol >= 1.4):
+            strategy_type = "SHORT"
+            tp = max(swing_low, close - (3.0 * atr))
+            sl = min(swing_high, close + (1.2 * atr))
             score = float(np.clip(rel_vol * 20 + abs(change_24h) * 5, 50, 100))
         else:
             return None
@@ -236,7 +250,7 @@ def analyze_symbol_v16(symbol: str) -> Optional[dict]:
             "symbol": symbol,
             "exchange": ex_id.upper(),
             "price": close,
-            "position_type": position_type,
+            "strategy_type": strategy_type,
             "tp": tp,
             "sl": sl,
             "rsi": rsi,
@@ -259,8 +273,8 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V16")
-    st.caption("롱(LONG) / 숏(SHORT) 포지션 자동 분류 및 다이내믹 TP/SL 퀀트 시스템")
+    st.title("🔥 Crypto Quant Dashboard V17")
+    st.caption("공격형 롱 / 안정형 롱 / 숏 포지션 3분할 퀀트 분석 시스템")
 
     market, active_exchange = fetch_tickers_with_fallback()
     if market.empty:
@@ -272,74 +286,96 @@ def main():
     universe = market[market["quote_volume"] >= 2_000_000].sort_values("quote_volume", ascending=False).head(25)
     symbols = universe["symbol"].tolist()
 
-    if st.button("🚀 롱 / 숏 추천 종목 정밀 스캔", use_container_width=True):
+    if st.button("🚀 3원화 전략 종목 정밀 스캔 실행", use_container_width=True):
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            futures = [pool.submit(analyze_symbol_v16, s) for s in symbols]
+            futures = [pool.submit(analyze_symbol_v17, s) for s in symbols]
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v16_results"] = results
+        st.session_state["v17_results"] = results
 
-    results = st.session_state.get("v16_results", [])
+    results = st.session_state.get("v17_results", [])
     if results:
         df_res = pd.DataFrame(results)
         
-        long_df = df_res[df_res["position_type"] == "LONG"].sort_values("score", ascending=False)
-        short_df = df_res[df_res["position_type"] == "SHORT"].sort_values("score", ascending=False)
+        agg_long_df = df_res[df_res["strategy_type"] == "AGGRESSIVE_LONG"].sort_values("score", ascending=False)
+        stable_long_df = df_res[df_res["strategy_type"] == "STABLE_LONG"].sort_values("score", ascending=False)
+        short_df = df_res[df_res["strategy_type"] == "SHORT"].sort_values("score", ascending=False)
 
-        col1, col2 = st.columns(2)
+        col1, col2, col3 = st.columns(3)
 
         with col1:
-            st.markdown("### 🟢 추천 롱 (LONG) 포지션")
-            st.caption("상승 추세 지지 또는 거래량 동반 상방 돌파 종목군입니다.")
-            if long_df.empty:
-                st.info("현재 조건에 부합하는 롱 종목이 없습니다.")
+            st.markdown("### 🔥 공격형 롱")
+            st.caption("거래량 폭증과 함께 고점을 돌파하는 고수익 모멘텀 종목")
+            if agg_long_df.empty:
+                st.info("조건에 맞는 종목 없음")
             else:
-                for _, row in long_df.iterrows():
+                for _, row in agg_long_df.iterrows():
                     st.markdown(f"""
-                    <div class="coin-card-long">
+                    <div class="card-agg-long">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
                             <div>
-                                <span class="badge-long">🟢 LONG (매수)</span> &nbsp;
-                                <b style="font-size: 15px; color: #0f172a;">{row['symbol']}</b> 
-                                <span style="font-size: 11px; color: #64748b;">({row['exchange']})</span>
+                                <span class="badge-agg">AGG LONG</span> &nbsp;
+                                <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b>
                             </div>
-                            <div style="font-size: 13px; color: #334155;">
-                                <b>현재가:</b> {fmt_price(row['price'])}
+                            <div style="font-size: 12px; color: #334155;">
+                                <b>{fmt_price(row['price'])}</b>
                             </div>
                         </div>
-                        <div style="margin-top: 8px; font-size: 12px; color: #475569; background: #ffffff; padding: 6px 10px; border-radius: 6px;">
-                            🎯 <b>TP(목표가):</b> <code style="color: #10b981;">{fmt_price(row['tp'])}</code> &nbsp;|&nbsp; 
-                            🛑 <b>SL(손절가):</b> <code style="color: #ef4444;">{fmt_price(row['sl'])}</code><br>
-                            📊 <b>RSI:</b> {row['rsi']:.1f} &nbsp;|&nbsp; <b>상대볼륨:</b> {row['rel_vol']:.1f}배 &nbsp;|&nbsp; <b>권장비중:</b> <b>{row['allocation']:.0f}%</b>
+                        <div style="margin-top: 6px; font-size: 11px; color: #475569; background: #ffffff; padding: 6px; border-radius: 6px;">
+                            🎯 TP: <code style="color: #e11d48;">{fmt_price(row['tp'])}</code> | 🛑 SL: <code style="color: #64748b;">{fmt_price(row['sl'])}</code><br>
+                            📊 RSI: {row['rsi']:.1f} | 볼륨: {row['rel_vol']:.1f}배 | 비중: <b>{row['allocation']:.0f}%</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
 
         with col2:
-            st.markdown("### 🔴 추천 숏 (SHORT) 포지션")
-            st.caption("저항선 부근 과매수 이탈 또는 하방 압력이 우세한 종목군입니다.")
+            st.markdown("### 🛡️ 안정형 롱")
+            st.caption("이평선 지지를 받으며 안전하게 반등하는 스윙 매집 종목")
+            if stable_long_df.empty:
+                st.info("조건에 맞는 종목 없음")
+            else:
+                for _, row in stable_long_df.iterrows():
+                    st.markdown(f"""
+                    <div class="card-stable-long">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <div>
+                                <span class="badge-stable">STABLE LONG</span> &nbsp;
+                                <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b>
+                            </div>
+                            <div style="font-size: 12px; color: #334155;">
+                                <b>{fmt_price(row['price'])}</b>
+                            </div>
+                        </div>
+                        <div style="margin-top: 6px; font-size: 11px; color: #475569; background: #ffffff; padding: 6px; border-radius: 6px;">
+                            🎯 TP: <code style="color: #10b981;">{fmt_price(row['tp'])}</code> | 🛑 SL: <code style="color: #64748b;">{fmt_price(row['sl'])}</code><br>
+                            📊 RSI: {row['rsi']:.1f} | 볼륨: {row['rel_vol']:.1f}배 | 비중: <b>{row['allocation']:.0f}%</b>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        with col3:
+            st.markdown("### 🔴 숏 포지션")
+            st.caption("과매수권 저항 이탈 또는 하방 압력이 우세한 하락 베팅 종목")
             if short_df.empty:
-                st.info("현재 조건에 부합하는 숏 종목이 없습니다.")
+                st.info("조건에 맞는 종목 없음")
             else:
                 for _, row in short_df.iterrows():
                     st.markdown(f"""
-                    <div class="coin-card-short">
+                    <div class="card-short">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
                             <div>
-                                <span class="badge-short">🔴 SHORT (매도)</span> &nbsp;
-                                <b style="font-size: 15px; color: #0f172a;">{row['symbol']}</b> 
-                                <span style="font-size: 11px; color: #64748b;">({row['exchange']})</span>
+                                <span class="badge-short">SHORT</span> &nbsp;
+                                <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b>
                             </div>
-                            <div style="font-size: 13px; color: #334155;">
-                                <b>현재가:</b> {fmt_price(row['price'])}
+                            <div style="font-size: 12px; color: #334155;">
+                                <b>{fmt_price(row['price'])}</b>
                             </div>
                         </div>
-                        <div style="margin-top: 8px; font-size: 12px; color: #475569; background: #ffffff; padding: 6px 10px; border-radius: 6px;">
-                            🎯 <b>TP(목표가):</b> <code style="color: #10b981;">{fmt_price(row['tp'])}</code> &nbsp;|&nbsp; 
-                            🛑 <b>SL(손절가):</b> <code style="color: #ef4444;">{fmt_price(row['sl'])}</code><br>
-                            📊 <b>RSI:</b> {row['rsi']:.1f} &nbsp;|&nbsp; <b>상대볼륨:</b> {row['rel_vol']:.1f}배 &nbsp;|&nbsp; <b>권장비중:</b> <b>{row['allocation']:.0f}%</b>
+                        <div style="margin-top: 6px; font-size: 11px; color: #475569; background: #ffffff; padding: 6px; border-radius: 6px;">
+                            🎯 TP: <code style="color: #dc2626;">{fmt_price(row['tp'])}</code> | 🛑 SL: <code style="color: #64748b;">{fmt_price(row['sl'])}</code><br>
+                            📊 RSI: {row['rsi']:.1f} | 볼륨: {row['rel_vol']:.1f}배 | 비중: <b>{row['allocation']:.0f}%</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
