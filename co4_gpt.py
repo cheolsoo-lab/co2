@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V31 (Profit Maximization & Robust Multi-Timeframe WFO Engine)
+Crypto Quant Dashboard V32 (Full Exchange Universe Scan + Multi-Timeframe WFO Engine)
+- Scans ALL USDT Perpetual Swap Symbols on Exchange
 - Multi-Timeframe Confluence (1D Trend + 4H Swing + 1H/15m Precise Entry)
-- Dynamic WFO Regime Optimization & Alpha RS Scoring
 - Bitget Auto Futures Order: Max Leverage + 1% Asset Risk + TP/SL OCO Execution
 """
 
@@ -22,7 +22,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V31",
+    page_title="🔥 Crypto Quant Dashboard V32",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -248,13 +248,13 @@ def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
 
     if btc_change > 1.0 and avg_change > 0.3:
         phase = "🚀 강한 상승장 (Risk-On)"
-        action_guide = "1D 대세 상승 속 1H·15m 정밀 타점(눌림목/돌파) 롱 포지션 공략 권장"
+        action_guide = "전체 코인 전수 조사 중! 1D 대세 상승 속 1H·15m 정밀 롱(LONG) 포지션 공략 권장"
     elif btc_change < -1.0 or avg_change < -0.5:
         phase = "🩸 하락 추세 (Risk-Off)"
-        action_guide = "1D 하락 방패 속 1H·15m 반등 실패 숏(SHORT) 포지션 집중 대응"
+        action_guide = "전체 코인 전수 조사 중! 1D 하락 방패 속 1H·15m 반등 실패 숏(SHORT) 집중 대응"
     else:
         phase = "⚖️ 혼조세 및 박스권 횡보장"
-        action_guide = "노이즈가 많으므로 15m 수급 유입 종목 위주로 선별 매매"
+        action_guide = "전체 코인 전수 조사 중! 노이즈가 많으므로 15m 수급 유입 종목 위주로 선별 매매"
 
     return {"phase": phase, "action_guide": action_guide, "btc_change": btc_change, "avg_change": avg_change}
 
@@ -264,7 +264,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
     st.markdown(f"""
     <div class="macro-card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <h3 style="margin: 0; color: #1e293b;">🌐 거시적 종합분석 & 멀티타임프레임(1D+4H+1H+15m) 센티먼트</h3>
+            <h3 style="margin: 0; color: #1e293b;">🌐 거시적 종합분석 & 전체 코인 전수 조사 센티먼트</h3>
             <span style="background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 14px;">
                 {m['phase']}
             </span>
@@ -275,7 +275,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
         <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 12px 0;">
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
             <div class="stat-pill">₿ BTC 24H 변동률: <b>{m['btc_change']:+.2f}%</b></div>
-            <div class="stat-pill">📊 시장 평균 변동률: <b>{m['avg_change']:+.2f}%</b></div>
+            <div class="stat-pill">📊 시장 전수 조사 종목: <b>{len(market_df)}개 심볼</b></div>
             <div class="stat-pill">⚡ WFO 수익 극대화 엔진: <b>활성 가동 중</b></div>
         </div>
     </div>
@@ -289,14 +289,14 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
         </div>
         <p style="font-size: 13px; color: #475569; margin: 0;">
             • <b>시장 레짐:</b> {wfo_res['regime']}<br>
-            • <b>동적 최적화 파라미터:</b> 타겟 ATR 배수 <b>{wfo_res['atr_mult']}x</b> | RS 컷오프 <b>{wfo_res['rs_cut']:+.2f}%</b> (1D+4H+1H+15m 필터 연동)
+            • <b>동적 최적화 파라미터:</b> 타겟 ATR 배수 <b>{wfo_res['atr_mult']}x</b> | RS 컷오프 <b>{wfo_res['rs_cut']:+.2f}%</b> (전체 종목 적용)
         </p>
     </div>
     """, unsafe_allow_html=True)
     st.divider()
 
 
-def analyze_symbol_v31(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
+def analyze_symbol_v32(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
     data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
     if not data:
         return None
@@ -329,7 +329,6 @@ def analyze_symbol_v31(symbol: str, exchange_id: str, market_avg_change: float, 
 
     group, pos_type = None, None
 
-    # 멀티타임프레임 컨플루언스 조건
     is_15m_long_momentum = float(r_15m["Close"]) > float(r_15m["EMA9"]) and rsi_1h < 75
     is_15m_short_momentum = float(r_15m["Close"]) < float(r_15m["EMA9"]) and rsi_1h > 25
 
@@ -344,23 +343,22 @@ def analyze_symbol_v31(symbol: str, exchange_id: str, market_avg_change: float, 
     else:
         return None
 
-    # 🛑 하이브리드 TP/SL 캡 안전장치 (0원 오류 방지 및 수익 극대화 손익비 세팅)
-    min_gap = close * 0.004  # 최소 0.4% 이상 안전 간격
+    min_gap = close * 0.004
     if pos_type == "LONG":
         raw_tp = close + (atr_mult * atr)
-        cap_tp = close * 1.07  # 최대 7% 익절 캡
+        cap_tp = close * 1.07
         tp = min(max(raw_tp, close + min_gap), cap_tp)
         
         raw_sl = close - (1.1 * atr)
-        floor_sl = close * 0.98  # 최대 2% 손절 캡
+        floor_sl = close * 0.98
         sl = max(min(raw_sl, close - (min_gap * 0.8)), floor_sl)
     else:
         raw_tp = close - (atr_mult * atr)
-        cap_tp = close * 0.93  # 최대 7% 익절 캡
+        cap_tp = close * 0.93
         tp = max(min(raw_tp, close - min_gap), cap_tp)
         
         raw_sl = close + (1.1 * atr)
-        floor_sl = close * 1.02  # 최대 2% 손절 캡
+        floor_sl = close * 1.02
         sl = min(max(raw_sl, close + (min_gap * 0.8)), floor_sl)
 
     score = float(np.clip(rel_vol * 25 + abs(relative_strength) * 12 + (50 - abs(rsi_4h - 50)), 40, 100))
@@ -384,8 +382,8 @@ def fmt_price(x):
 # ============================================================
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V31")
-    st.caption("WFO 수익 극대화 엔진 + 1D/4H/1H/15m 멀티타임프레임 + 비트겟 최대레버리지 & 1% 자산 자동매매")
+    st.title("🔥 Crypto Quant Dashboard V32")
+    st.caption("거래소 전체 코인 전수 조사 스캔 + WFO 수익 극대화 엔진 + 비트겟 최대레버리지 & 1% 자산 자동매매")
 
     st.sidebar.header("⚙️ 비트겟 선물 API 설정")
     bitget_api_key = st.sidebar.text_input("API Key", type="password")
@@ -394,49 +392,54 @@ def main():
     
     auto_trade_enabled = st.sidebar.checkbox("🚀 비트겟 실전 자동 주문 활성화", value=False)
 
-    with st.spinner("거래소 시세 데이터를 안전하게 불러오는 중입니다..."):
+    with st.spinner("거래소 전체 시세 데이터를 안전하게 불러오는 중입니다..."):
         market, active_exchange = fetch_tickers_safe()
 
     if market.empty:
         st.error("⚠️ 거래소 데이터 연결에 실패했습니다. 잠시 후 다시 시도해 주세요.")
         return
 
-    st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 데이터 연동 완료 (총 {len(market)}개 심볼 감지)")
+    st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 전체 연동 완료 (총 {len(market)}개 전체 심볼 감지)")
     
     wfo_params = run_walk_forward_optimization(market)
     render_market_horizon_dashboard(market, wfo_params)
 
-    universe = market.sort_values("quote_volume", ascending=False).head(50)
-    symbols = universe["symbol"].tolist()
+    # 🛑 Top 50 제한 해제 -> 전체 코인 유니버스 전수 조사 반영
+    symbols = market["symbol"].tolist()
     market_avg_change = float(market["change_pct"].mean())
 
-    if st.button("🚀 WFO 최적화 & 멀티타임프레임 Top 50 퀀트 스캔 실행", use_container_width=True):
+    if st.button(f"🚀 거래소 전체 코인 ({len(symbols)}개) 전수 조사 퀀트 스캔 실행", use_container_width=True):
         results = []
         progress_bar = st.progress(0)
+        status_text = st.empty()
         total_symbols = len(symbols)
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(analyze_symbol_v31, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
+        # 병렬 처리 워커 수 대폭 확대로 고속 전수 조사
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            futures = {pool.submit(analyze_symbol_v32, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
                 progress_bar.progress(completed / total_symbols)
+                status_text.text(f"🔍 전수 조사 진행 중... ({completed}/{total_symbols}) 완료")
                 r = f.result()
                 if r: results.append(r)
         
         progress_bar.empty()
-        st.session_state["v31_results"] = results
+        status_text.empty()
+        st.session_state["v32_results"] = results
 
-    results = st.session_state.get("v31_results", [])
+    results = st.session_state.get("v32_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
         stable_df = df_res[df_res["group"] == "STABLE"].sort_values("score", ascending=False)
 
+        st.success(f"🎉 총 {len(df_res)}개의 알파 포착 종목이 발굴되었습니다!")
         col1, col2 = st.columns(2)
 
         with col1:
-            st.markdown("### 🔥 공격형 알파 트레이딩 (수익 극대화 돌파)")
+            st.markdown(f"### 🔥 공격형 알파 트레이딩 (총 {len(agg_df)}개)")
             if agg_df.empty:
                 st.info("조건에 부합하는 공격형 종목이 없습니다.")
             else:
@@ -477,7 +480,7 @@ def main():
                                     st.error(f"❌ 주문 실패: {msg}")
 
         with col2:
-            st.markdown("### 🛡️ 안정형 스윙 트레이딩 (안정적 눌림목)")
+            st.markdown(f"### 🛡️ 안정형 스윙 트레이딩 (총 {len(stable_df)}개)")
             if stable_df.empty:
                 st.info("조건에 부합하는 안정형 종목이 없습니다.")
             else:
