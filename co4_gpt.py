@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V22 (Macro Comprehensive Analysis Restored)
-- Restored & Enhanced Macro Comprehensive Analysis Card
+Crypto Quant Dashboard V23 (Aggressive Alpha Sensitivity Boosted)
+- Lowered Vol/RS Thresholds for More Frequent Breakout Signals
+- Restored Macro Comprehensive Analysis & Top 50 Hybrid TP/SL Engine
 - Robust Multi-Exchange Fallback (Binance, Bybit, OKX)
-- Top 50 Coin Universe & Hybrid TP/SL Engine
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V22",
+    page_title="🔥 Crypto Quant Dashboard V23",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -176,15 +176,15 @@ def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
     avg_change = float(market_df["change_pct"].mean())
 
-    if btc_change > 1.5 and avg_change > 0.5:
+    if btc_change > 1.0 and avg_change > 0.3:
         phase = "🚀 강한 상승장 (Risk-On)"
-        action_guide = "공격형/안정형 롱(LONG) 포지션 중심의 주도주 집중 매매 권장"
-    elif btc_change < -1.5 or avg_change < -0.8:
+        action_guide = "공격형 돌파 및 주도주 중심의 적극적인 롱(LONG) 포지션 공략 권장"
+    elif btc_change < -1.0 or avg_change < -0.5:
         phase = "🩸 하락 추세 (Risk-Off)"
-        action_guide = "공격형 및 안정형 숏(SHORT) 베팅 및 현금 비중 확대 대응"
+        action_guide = "공격형/안정형 숏(SHORT) 베팅 및 하락 돌파 종목 집중 대응"
     else:
         phase = "⚖️ 혼조세 및 박스권 횡보장"
-        action_guide = "무리한 추격 매수 자제, 1D/4H 눌림목 중심의 엄선된 종목 선별 대응"
+        action_guide = "돌파 실패에 유의하며 완화된 조건으로 선별된 모멘텀 종목 매매"
 
     return {
         "phase": phase,
@@ -211,7 +211,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
             <div class="stat-pill">₿ BTC 24H 변동률: <b>{m['btc_change']:+.2f}%</b></div>
             <div class="stat-pill">📊 시장 평균 변동률: <b>{m['avg_change']:+.2f}%</b></div>
-            <div class="stat-pill">⚡ 엔진 구성: <b>1D추세 + 4H타점 + RS + 하이브리드 TP/SL</b></div>
+            <div class="stat-pill">⚡ 엔진 V23: <b>공격형 감도 상향 & 하이브리드 TP/SL</b></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -219,10 +219,10 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
 
 
 # ============================================================
-# 3. QUANT ANALYSIS & UI
+# 3. QUANT ANALYSIS & UI (V23: 공격형 필터 완화)
 # ============================================================
 
-def analyze_symbol_v22(symbol: str, exchange_id: str, market_avg_change: float) -> Optional[dict]:
+def analyze_symbol_v23(symbol: str, exchange_id: str, market_avg_change: float) -> Optional[dict]:
     data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
     if not data:
         return None
@@ -248,13 +248,14 @@ def analyze_symbol_v22(symbol: str, exchange_id: str, market_avg_change: float) 
 
     group, pos_type = None, None
 
-    if r_1d["Close"] > r_1d["EMA20"] and rel_vol >= 1.3 and relative_strength > 0.5 and rsi_4h < 75:
+    # 🚀 [V23 핵심 변경] 공격형 조건 완화 (거래량 1.3배 -> 1.05배, 상대강도 0.5% -> 0.1%로 낮춰 잘 잡히도록 개선)
+    if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.05 and relative_strength > 0.1 and rsi_4h < 78:
         group, pos_type = "AGGRESSIVE", "LONG"
-    elif r_1d["Close"] < r_1d["EMA20"] and rel_vol >= 1.3 and relative_strength < -0.5 and rsi_4h > 25:
+    elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.05 and relative_strength < -0.1 and rsi_4h > 22:
         group, pos_type = "AGGRESSIVE", "SHORT"
-    elif r_1d["Close"] >= r_1d["EMA20"] and close >= float(r_4h["EMA20"]) and 40 <= rsi_4h <= 65 and funding_rate <= 0.0008:
+    elif close >= float(r_4h["EMA20"]) and 38 <= rsi_4h <= 68 and funding_rate <= 0.001:
         group, pos_type = "STABLE", "LONG"
-    elif r_1d["Close"] < r_1d["EMA20"] and rsi_4h >= 60 and funding_rate >= 0.0006:
+    elif rsi_4h >= 58 and funding_rate >= 0.0005:
         group, pos_type = "STABLE", "SHORT"
     else:
         return None
@@ -294,8 +295,8 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V22")
-    st.caption("거시적 종합분석 및 Top 50 코인 하이브리드 퀀트 스캐너")
+    st.title("🔥 Crypto Quant Dashboard V23")
+    st.caption("공격형 돌파 감도 상향 및 거시적 종합분석 탑재 스캐너")
 
     with st.spinner("시세 데이터를 안전하게 불러오는 중입니다..."):
         market, active_exchange = fetch_tickers_safe()
@@ -306,20 +307,19 @@ def main():
 
     st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 데이터 연동 완료 (총 {len(market)}개 심볼 감지)")
     
-    # 🌐 거시적 종합분석 카드 렌더링
     render_market_horizon_dashboard(market)
 
     universe = market.sort_values("quote_volume", ascending=False).head(50)
     symbols = universe["symbol"].tolist()
     market_avg_change = float(market["change_pct"].mean())
 
-    if st.button("🚀 Top 50 종목 하이브리드 퀀트 스캔 실행", use_container_width=True):
+    if st.button("🚀 Top 50 종목 하이브리드 퀀트 스캔 실행 (공격형 감도 UP)", use_container_width=True):
         results = []
         progress_bar = st.progress(0)
         total_symbols = len(symbols)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(analyze_symbol_v22, s, active_exchange, market_avg_change): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v23, s, active_exchange, market_avg_change): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -329,9 +329,9 @@ def main():
                     results.append(r)
         
         progress_bar.empty()
-        st.session_state["v22_results"] = results
+        st.session_state["v23_results"] = results
 
-    results = st.session_state.get("v22_results", [])
+    results = st.session_state.get("v23_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
@@ -342,7 +342,7 @@ def main():
         with col1:
             st.markdown("### 🔥 공격형 알파 트레이딩 (돌파)")
             if agg_df.empty:
-                st.info("조건에 부합하는 공격형 종목이 없습니다.")
+                st.info("조건을 완화했음에도 현재 장세에서 부합하는 공격형 종목이 없습니다.")
             else:
                 for _, row in agg_df.iterrows():
                     is_long = row["pos_type"] == "LONG"
