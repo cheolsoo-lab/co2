@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V6
-- Main Screen Macro Regime Bar Restored (BTC, Dominance, Total2/3 Flow)
-- Intuitive Long (🟢) vs Short (🔴) Visual Separation
-- Explicit TP, SL, and Entry Price Cards
-- Aggressive (Trend) vs Defensive (Reversal) Tab Separation
+Crypto Quant Dashboard V7
+- Physical Separation of LONG vs SHORT inside Aggressive & Defensive Tabs
+- Main Screen Macro Regime Bar (BTC, Dominance, Liquidity Flow)
+- Dynamic ATR TP Extension, ML Ensemble, Hierarchical MTF
 """
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ from sklearn.linear_model import LogisticRegression
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V6",
+    page_title="🔥 Crypto Quant Dashboard V7",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -144,11 +143,9 @@ def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d",
 
 
 def render_macro_regime_bar(market_df: pd.DataFrame):
-    """메인 상단 글로벌 매크로 분석 (BTC 추세, 유동성 흐름 직관적 요약)"""
     btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
     
-    # 상위 알트 및 시총 지표 프록시 분석
     total_vol = market_df["quote_volume"].sum()
     majors_vol = market_df[market_df["base"].isin(["BTC", "ETH"])]["quote_volume"].sum()
     btc_dominance_proxy = (majors_vol / total_vol) * 100 if total_vol > 0 else 50.0
@@ -359,7 +356,7 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
 
 
 # ============================================================
-# 7. STREAMLIT UI (매크로 분석바 + 한줄 간략 정리 적용)
+# 7. STREAMLIT UI (롱/숏 물리적 분리 및 한줄 정리 렌더링)
 # ============================================================
 
 def fmt_price(x):
@@ -369,8 +366,8 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V6")
-    st.caption("글로벌 매크로 레짐 분석 탑재 · 공격형/방어형 분리 매매판")
+    st.title("🔥 Crypto Quant Dashboard V7")
+    st.caption("글로벌 매크로 레짐 분석 탑재 · 롱/숏 물리적 분리 매매판")
 
     with st.sidebar:
         st.header("⚙️ 설정")
@@ -384,7 +381,6 @@ def main():
     else:
         st.caption(f"데이터 연동 성공 거래소: **{active_exchange.upper()}**")
 
-    # 상단 글로벌 매크로 레짐 바 렌더링
     render_macro_regime_bar(market)
     st.divider()
 
@@ -398,9 +394,9 @@ def main():
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v6_results"] = results
+        st.session_state["v7_results"] = results
 
-    results = st.session_state.get("v6_results", [])
+    results = st.session_state.get("v7_results", [])
     if results:
         df_res = pd.DataFrame(results)
         
@@ -409,37 +405,69 @@ def main():
         with tab1:
             st.markdown("### 🔥 공격형 추종 포지션 (ATR 4~6배 파도타기)")
             agg_rows = df_res[df_res["mode_type"] == "AGGRESSIVE"]
+            
             if agg_rows.empty:
                 st.info("현재 공격적 추세 조건을 만족하는 종목이 없습니다.")
-            
-            for _, row in agg_rows.iterrows():
-                sig = row["signal"]
-                is_long = row["direction"] == "LONG"
-                badge = "🟢 **LONG**" if is_long else "🔴 **SHORT**"
-                
-                # 가독성을 극대화한 한줄 간략 정리 포맷
-                st.markdown(
-                    f"🔥 **{row['symbol']}** | {badge} | 🎯 **TP**: {fmt_price(sig['tp'])} | "
-                    f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
-                    f"점수: {row['score']:.1f} | R:R: 1:{sig['rr']:.2f}"
-                )
+            else:
+                # 🟢 롱과 숏을 물리적으로 완벽히 분리
+                agg_longs = agg_rows[agg_rows["direction"] == "LONG"]
+                agg_shorts = agg_rows[agg_rows["direction"] == "SHORT"]
+
+                st.markdown("#### 🟢 LONG (매수) 추천 리스트")
+                if agg_longs.empty:
+                    st.caption("조건을 만족하는 롱 종목이 없습니다.")
+                for _, row in agg_longs.iterrows():
+                    sig = row["signal"]
+                    st.markdown(
+                        f"🔥 **{row['symbol']}** | 🟢 **LONG** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
+                        f"점수: {row['score']:.1f} | R:R: 1:{sig['rr']:.2f}"
+                    )
+
+                st.markdown("---")
+                st.markdown("#### 🔴 SHORT (매도) 추천 리스트")
+                if agg_shorts.empty:
+                    st.caption("조건을 만족하는 숏 종목이 없습니다.")
+                for _, row in agg_shorts.iterrows():
+                    sig = row["signal"]
+                    st.markdown(
+                        f"🔥 **{row['symbol']}** | 🔴 **SHORT** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
+                        f"점수: {row['score']:.1f} | R:R: 1:{sig['rr']:.2f}"
+                    )
 
         with tab2:
             st.markdown("### 🛡️ 방어형 숏컷 헌터 포지션 (짧은 익절 / 칼손절)")
             def_rows = df_res[df_res["mode_type"] == "DEFENSIVE"]
+            
             if def_rows.empty:
                 st.info("현재 방어적 국면에 부합하는 종목이 없습니다.")
-                
-            for _, row in def_rows.iterrows():
-                sig = row["signal"]
-                is_long = row["direction"] == "LONG"
-                badge = "🟢 **LONG**" if is_long else "🔴 **SHORT**"
-                
-                st.markdown(
-                    f"🛡️ **{row['symbol']}** | {badge} | 🎯 **TP**: {fmt_price(sig['tp'])} | "
-                    f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
-                    f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
-                )
+            else:
+                def_longs = def_rows[def_rows["direction"] == "LONG"]
+                def_shorts = def_rows[def_rows["direction"] == "SHORT"]
+
+                st.markdown("#### 🟢 LONG (매수) 추천 리스트")
+                if def_longs.empty:
+                    st.caption("조건을 만족하는 롱 종목이 없습니다.")
+                for _, row in def_longs.iterrows():
+                    sig = row["signal"]
+                    st.markdown(
+                        f"🛡️ **{row['symbol']}** | 🟢 **LONG** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
+                        f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
+                    )
+
+                st.markdown("---")
+                st.markdown("#### 🔴 SHORT (매도) 추천 리스트")
+                if def_shorts.empty:
+                    st.caption("조건을 만족하는 숏 종목이 없습니다.")
+                for _, row in def_shorts.iterrows():
+                    sig = row["signal"]
+                    st.markdown(
+                        f"🛡️ **{row['symbol']}** | 🔴 **SHORT** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
+                        f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
+                    )
 
 
 if __name__ == "__main__":
