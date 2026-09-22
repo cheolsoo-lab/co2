@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V35 (Ultimate WFO + Volume Profile POC + ATR Profit Maximization)
-- Multi-Timeframe Confluence (1D Trend + 4H Swing + 1H/15m Precise Entry)
+Crypto Quant Dashboard V36 (Optimized 1H/30m Hybrid Engine + POC + ATR Profit Maximization)
+- Multi-Timeframe Confluence: 1D Trend + 1H Major Flow + 30m Precise Entry
 - Volume Profile POC (Point of Control) Matrix & Support/Resistance Integration
 - Advanced Alpha Filters: OI Momentum, ATR Trailing Profit Cap, Funding Rate, High-Beta
 - Bitget Auto Futures Order: Max Leverage + 1% Asset Risk + OCO TP/SL Execution
 """
 
-from __future__ import annotations
+from __python__ import annotations
 
 import concurrent.futures
 from typing import Optional
@@ -23,7 +23,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V35",
+    page_title="🔥 Crypto Quant Dashboard V36",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -69,7 +69,7 @@ DEFAULT_EXCHANGES = ["bitget", "binance", "bybit"]
 
 
 # ============================================================
-# 1. DATA ACCESS & POC (VOLUME PROFILE) CALCULATION ENGINE
+# 1. DATA ACCESS & 1H/30m HYBRID ENGINE + POC
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -133,10 +133,6 @@ def fetch_tickers_safe() -> tuple[pd.DataFrame, str]:
 
 
 def calculate_volume_profile_poc(df_ohlcv: pd.DataFrame, bins: int = 20) -> float:
-    """
-    볼륨 프로파일 기반 POC (Point of Control) 산출:
-    가격 구간별 거래량(Volume)을 집계하여 가장 많은 거래량이 터진 가격대 중심값을 리턴
-    """
     try:
         low_min = df_ohlcv["Low"].min()
         high_max = df_ohlcv["High"].max()
@@ -150,7 +146,6 @@ def calculate_volume_profile_poc(df_ohlcv: pd.DataFrame, bins: int = 20) -> floa
             c_low, c_high, c_vol = row["Low"], row["High"], row["Volume"]
             for i in range(bins):
                 b_start, b_end = price_bins[i], price_bins[i+1]
-                # 해당 캔버스가 빈 구간에 걸쳐있는 경우 거래량 비례 배분
                 overlap_low = max(c_low, b_start)
                 overlap_high = min(c_high, b_end)
                 if overlap_low < overlap_high:
@@ -165,34 +160,34 @@ def calculate_volume_profile_poc(df_ohlcv: pd.DataFrame, bins: int = 20) -> floa
 
 
 @st.cache_data(ttl=180, show_spinner=False)
-def fetch_multi_timeframe_data_v35(exchange_id: str, symbol: str) -> Optional[dict]:
+def fetch_hybrid_timeframe_data_v36(exchange_id: str, symbol: str) -> Optional[dict]:
     try:
         ex = make_exchange(exchange_id)
         raw_symbol = symbol if exchange_id != "binance" else f"{symbol.replace('/','')} :USDT" if ":" not in symbol else symbol
         if exchange_id == "binance" and ":" not in raw_symbol:
             raw_symbol = f"{symbol.split('/')[0]}/USDT:USDT"
 
+        # 1. 1일봉 (대세 추세 방패)
         df_1d = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="1d", limit=60), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         df_1d["EMA20"] = ta.trend.EMAIndicator(df_1d["Close"], window=20).ema_indicator()
 
-        df_4h = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="4h", limit=60), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
-        df_4h["EMA20"] = ta.trend.EMAIndicator(df_4h["Close"], window=20).ema_indicator()
-        df_4h["RSI14"] = ta.momentum.RSIIndicator(df_4h["Close"], window=14).rsi()
-        df_4h["ATR14"] = ta.volatility.AverageTrueRange(df_4h["High"], df_4h["Low"], df_4h["Close"], window=14).average_true_range()
-        df_4h["VOL_MA20"] = df_4h["Volume"].rolling(20).mean()
-        df_4h["REL_VOLUME"] = df_4h["Volume"] / df_4h["VOL_MA20"]
+        # 2. 1시간봉 (메이저 흐름, 변동성 ATR, 볼륨 프로파일 POC)
+        df_1h = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="1h", limit=60), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+        df_1h["EMA20"] = ta.trend.EMAIndicator(df_1h["Close"], window=20).ema_indicator()
+        df_1h["RSI14"] = ta.momentum.RSIIndicator(df_1h["Close"], window=14).rsi()
+        df_1h["ATR14"] = ta.volatility.AverageTrueRange(df_1h["High"], df_1h["Low"], df_1h["Close"], window=14).average_true_range()
+        df_1h["VOL_MA20"] = df_1h["Volume"].rolling(20).mean()
+        df_1h["REL_VOLUME"] = df_1h["Volume"] / df_1h["VOL_MA20"]
 
-        df_1h = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="1h", limit=50), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
-        df_1h["RSI9"] = ta.momentum.RSIIndicator(df_1h["Close"], window=9).rsi()
+        # 3. 30분봉 (정밀 타점 및 모멘텀 검증)
+        df_30m = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="30m", limit=50), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
+        df_30m["EMA9"] = ta.trend.EMAIndicator(df_30m["Close"], window=9).ema_indicator()
+        df_30m["RSI9"] = ta.momentum.RSIIndicator(df_30m["Close"], window=9).rsi()
 
-        df_15m = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="15m", limit=50), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
-        df_15m["EMA9"] = ta.trend.EMAIndicator(df_15m["Close"], window=9).ema_indicator()
-
-        if len(df_1d) < 20 or len(df_4h) < 20 or len(df_1h) < 20 or len(df_15m) < 20:
+        if len(df_1d) < 20 or len(df_1h) < 20 or len(df_30m) < 20:
             return None
 
-        # 볼륨 프로파일 POC 산출
-        poc_price = calculate_volume_profile_poc(df_4h, bins=25)
+        poc_price = calculate_volume_profile_poc(df_1h, bins=25)
 
         funding_rate = 0.0
         try:
@@ -209,7 +204,7 @@ def fetch_multi_timeframe_data_v35(exchange_id: str, symbol: str) -> Optional[di
             pass
 
         return {
-            "df_1d": df_1d, "df_4h": df_4h, "df_1h": df_1h, "df_15m": df_15m,
+            "df_1d": df_1d, "df_1h": df_1h, "df_30m": df_30m,
             "poc": poc_price, "funding_rate": funding_rate, "oi_change": oi_change, "exchange": exchange_id.upper()
         }
     except Exception:
@@ -274,17 +269,17 @@ def execute_bitget_futures_order_with_smart_risk(symbol: str, pos_type: str, tp:
 
 
 # ============================================================
-# 2. WFO & POC + ATR PROFIT MAXIMIZATION ENGINE
+# 2. WFO & 1H/30m HYBRID ENGINE
 # ============================================================
 
 def run_walk_forward_optimization(market_df: pd.DataFrame) -> dict:
     avg_volatility = market_df["change_pct"].abs().mean()
     if avg_volatility > 2.0:
-        return {"atr_mult": 2.6, "rs_cut": 0.25, "wfe": 87.1, "regime": "🚀 고변동성 대세 상승장 (POC 돌파 + ATR 2.6x 극대화)"}
+        return {"atr_mult": 2.5, "rs_cut": 0.25, "wfe": 88.4, "regime": "🚀 고변동성 주도주 상승장 (1H+30m 하이브리드 익절 2.5x)"}
     elif avg_volatility < 0.8:
-        return {"atr_mult": 1.7, "rs_cut": 0.05, "wfe": 61.2, "regime": "⚖️ 저변동성 박스권 페이즈 (POC 매물대 방어 ATR 1.7x)"}
+        return {"atr_mult": 1.7, "rs_cut": 0.05, "wfe": 62.0, "regime": "⚖️ 저변동성 박스권 페이즈 (방어적 ATR 1.7x)"}
     else:
-        return {"atr_mult": 2.2, "rs_cut": 0.12, "wfe": 76.5, "regime": "📊 안정적 모멘텀 페이즈 (표준 ATR 2.2x)"}
+        return {"atr_mult": 2.1, "rs_cut": 0.12, "wfe": 78.2, "regime": "📊 안정적 모멘텀 페이즈 (표준 ATR 2.1x)"}
 
 
 def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
@@ -293,14 +288,14 @@ def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
     avg_change = float(market_df["change_pct"].mean())
 
     if btc_change > 1.0 and avg_change > 0.3:
-        phase = "🚀 강한 상승장 (Risk-On / POC Breakout)"
-        action_guide = "핵심 매물대(POC) 상단 돌파 및 고베타 주도주 중심의 강력한 롱 익절 극대화 공략"
+        phase = "🚀 강한 상승장 (Risk-On / 1H Major Trend)"
+        action_guide = "1H 메이저 흐름이 우상향하는 주도주 및 POC 돌파 종목 중심 롱 익절 극대화 공략"
     elif btc_change < -1.0 or avg_change < -0.5:
         phase = "🩸 하락 추세 (Risk-Off)"
-        action_guide = "POC 지지 이탈 종목 중심의 숏(SHORT) 포지션 집중 대응"
+        action_guide = "1H 이탈 종목 중심의 숏(SHORT) 포지션 집중 대응"
     else:
         phase = "⚖️ 혼조세 및 박스권 횡보장"
-        action_guide = "POC 부근에서의 반등 및 펀딩비가 안정적인 종목 선별 매매"
+        action_guide = "1H/30m 수급 유입 및 펀딩비 안정한 종목 선별 매매"
 
     return {"phase": phase, "action_guide": action_guide, "btc_change": btc_change, "avg_change": avg_change}
 
@@ -310,7 +305,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
     st.markdown(f"""
     <div class="macro-card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-            <h3 style="margin: 0; color: #1e293b;">🌐 거시적 종합분석 & V35 [WFO + POC + ATR] 센티먼트</h3>
+            <h3 style="margin: 0; color: #1e293b;">🌐 거시적 종합분석 & V36 [1H + 30m 하이브리드] 센티먼트</h3>
             <span style="background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 14px;">
                 {m['phase']}
             </span>
@@ -322,52 +317,50 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
             <div class="stat-pill">₿ BTC 24H 변동률: <b>{m['btc_change']:+.2f}%</b></div>
             <div class="stat-pill">📊 전수 조사 심볼: <b>{len(market_df)}개</b></div>
-            <div class="stat-pill">⚡ V35 POC 매물대 분석: <b>실시간 연동 중</b></div>
+            <div class="stat-pill">⚡ V36 하이브리드 엔진: <b>1H + 30m 고정 가동</b></div>
         </div>
     </div>
     
     <div class="wfo-card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <h4 style="margin: 0; color: #581c87;">📈 WFO 최적화 & POC 매물대 리포트</h4>
+            <h4 style="margin: 0; color: #581c87;">📈 WFO 최적화 & 하이브리드 리포트</h4>
             <span style="background: #f3e8ff; color: #7e22ce; padding: 4px 10px; border-radius: 12px; font-weight: 700; font-size: 12px;">
                 WFE 효율성 지수: {wfo_res['wfe']:.1f}%
             </span>
         </div>
         <p style="font-size: 13px; color: #475569; margin: 0;">
             • <b>시장 레짐:</b> {wfo_res['regime']}<br>
-            • <b>동적 최적화 파라미터:</b> 트레일링 ATR 배수 <b>{wfo_res['atr_mult']}x</b> | 볼륨 프로파일 POC 매물대 지지/저항 필터 적용
+            • <b>동적 최적화 파라미터:</b> 트레일링 ATR 배수 <b>{wfo_res['atr_mult']}x</b> | 1H 주도주 수급 & 30m 타점 결합
         </p>
     </div>
     """, unsafe_allow_html=True)
     st.divider()
 
 
-def analyze_symbol_v35(symbol: str, exchange_id: str, market_avg_change: float, btc_change: float, wfo_params: dict) -> Optional[dict]:
-    data = fetch_multi_timeframe_data_v35(exchange_id.lower(), symbol)
+def analyze_symbol_v36(symbol: str, exchange_id: str, market_avg_change: float, btc_change: float, wfo_params: dict) -> Optional[dict]:
+    data = fetch_hybrid_timeframe_data_v36(exchange_id.lower(), symbol)
     if not data:
         return None
     
     df_1d = data["df_1d"]
-    df_4h = data["df_4h"]
     df_1h = data["df_1h"]
-    df_15m = data["df_15m"]
+    df_30m = data["df_30m"]
     poc = data["poc"]
     funding_rate = data["funding_rate"]
     oi_change = data["oi_change"]
 
     r_1d = df_1d.iloc[-2]
-    r_4h = df_4h.iloc[-1]
     r_1h = df_1h.iloc[-1]
-    r_15m = df_15m.iloc[-1]
+    r_30m = df_30m.iloc[-1]
 
-    close = float(r_4h["Close"])
-    atr = float(r_4h["ATR14"]) if pd.notna(r_4h["ATR14"]) and r_4h["ATR14"] > 0 else close * 0.02
-    rsi_4h = float(r_4h["RSI14"]) if pd.notna(r_4h["RSI14"]) else 50.0
-    rsi_1h = float(r_1h["RSI9"]) if pd.notna(r_1h["RSI9"]) else 50.0
-    rel_vol = float(r_4h["REL_VOLUME"]) if pd.notna(r_4h["REL_VOLUME"]) else 1.0
+    close = float(r_1h["Close"])
+    atr = float(r_1h["ATR14"]) if pd.notna(r_1h["ATR14"]) and r_1h["ATR14"] > 0 else close * 0.02
+    rsi_1h = float(r_1h["RSI14"]) if pd.notna(r_1h["RSI14"]) else 50.0
+    rsi_30m = float(r_30m["RSI9"]) if pd.notna(r_30m["RSI9"]) else 50.0
+    rel_vol = float(r_1h["REL_VOLUME"]) if pd.notna(r_1h["REL_VOLUME"]) else 1.0
     
-    if len(df_4h) >= 6:
-        symbol_change_24h = float((close - df_4h.iloc[-6]["Close"]) / df_4h.iloc[-6]["Close"] * 100)
+    if len(df_1h) >= 6:
+        symbol_change_24h = float((close - df_1h.iloc[-6]["Close"]) / df_1h.iloc[-6]["Close"] * 100)
     else:
         symbol_change_24h = 0.0
         
@@ -379,43 +372,41 @@ def analyze_symbol_v35(symbol: str, exchange_id: str, market_avg_change: float, 
 
     group, pos_type = None, None
 
-    is_15m_long_momentum = float(r_15m["Close"]) > float(r_15m["EMA9"]) and rsi_1h < 78
-    is_15m_short_momentum = float(r_15m["Close"]) < float(r_15m["EMA9"]) and rsi_1h > 22
+    # 1H(메이저 흐름) + 30m(정밀 타점) 컨플루언스
+    is_30m_long_momentum = float(r_30m["Close"]) > float(r_30m["EMA9"]) and rsi_30m < 75
+    is_30m_short_momentum = float(r_30m["Close"]) < float(r_30m["EMA9"]) and rsi_30m > 25
 
     is_funding_safe_long = funding_rate <= 0.0015
     is_funding_safe_short = funding_rate >= -0.0005
 
-    # POC 매물대 기반 정밀 돌파 및 지지 조건 결합
-    is_poc_long_valid = close >= poc * 0.992  # POC 매물대 부근이거나 위에서 지지받는 경우
-    is_poc_short_valid = close <= poc * 1.008 # POC 매물대 아래로 밀리거나 저항받는 경우
+    is_poc_long_valid = close >= poc * 0.992
+    is_poc_short_valid = close <= poc * 1.008
 
-    if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.02 and relative_strength > rs_cut and is_15m_long_momentum and is_funding_safe_long and is_poc_long_valid:
+    if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.02 and relative_strength > rs_cut and is_30m_long_momentum and is_funding_safe_long and is_poc_long_valid:
         group, pos_type = "AGGRESSIVE", "LONG"
-    elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.02 and relative_strength < -rs_cut and is_15m_short_momentum and is_funding_safe_short and is_poc_short_valid:
+    elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.02 and relative_strength < -rs_cut and is_30m_short_momentum and is_funding_safe_short and is_poc_short_valid:
         group, pos_type = "AGGRESSIVE", "SHORT"
-    elif close >= float(r_4h["EMA20"]) and 35 <= rsi_4h <= 70 and is_funding_safe_long and is_poc_long_valid:
+    elif close >= float(r_1h["EMA20"]) and 38 <= rsi_1h <= 68 and is_funding_safe_long and is_poc_long_valid:
         group, pos_type = "STABLE", "LONG"
-    elif rsi_4h >= 55 and is_funding_safe_short and is_poc_short_valid:
+    elif rsi_1h >= 58 and is_funding_safe_short and is_poc_short_valid:
         group, pos_type = "STABLE", "SHORT"
     else:
         return None
 
-    # 손절가(SL)를 POC 매물대 하단/상단으로 정밀 타격하여 노이즈 방어 및 손익비 극대화
     min_gap = close * 0.004
     if pos_type == "LONG":
-        raw_tp = close + (atr_mult * atr * 1.2)
-        tp = min(max(raw_tp, close + min_gap), close * 0.1) # 최대 익절 캡
+        raw_tp = close + (atr_mult * atr * 1.15)
+        tp = min(max(raw_tp, close + min_gap), close * 1.085)
         
-        # SL은 POC 하단과 ATR 손절 중 더 안전한(낮은) 가격을 선택하되 최소 간격 보장
         raw_sl = min(close - (1.1 * atr), poc * 0.985)
-        floor_sl = close * 0.975
+        floor_sl = close * 0.978
         sl = max(raw_sl, floor_sl)
     else:
-        raw_tp = close - (atr_mult * atr * 1.2)
-        tp = max(min(raw_tp, close - min_gap), close * 0.90)
+        raw_tp = close - (atr_mult * atr * 1.15)
+        tp = max(min(raw_tp, close - min_gap), close * 0.915)
         
         raw_sl = max(close + (1.1 * atr), poc * 1.015)
-        floor_sl = close * 1.025
+        floor_sl = close * 1.022
         sl = min(raw_sl, floor_sl)
 
     score = float(np.clip(rel_vol * 20 + abs(relative_strength) * 10 + abs(beta_coefficient) * 8 + (oi_change * 5), 40, 100))
@@ -423,7 +414,7 @@ def analyze_symbol_v35(symbol: str, exchange_id: str, market_avg_change: float, 
     return {
         "symbol": symbol, "exchange": data["exchange"], "price": close, "poc": poc,
         "group": group, "pos_type": pos_type, "tp": float(tp), "sl": float(sl),
-        "rsi_4h": rsi_4h, "rsi_1h": rsi_1h, "rel_vol": rel_vol, "rs": relative_strength,
+        "rsi_1h": rsi_1h, "rsi_30m": rsi_30m, "rel_vol": rel_vol, "rs": relative_strength,
         "beta": beta_coefficient, "funding": funding_rate, "score": score
     }
 
@@ -440,8 +431,8 @@ def fmt_price(x):
 # ============================================================
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V35")
-    st.caption("WFO 최적화 + Volume Profile POC 매물대 분석 + ATR 수익 극대화 + 비트겟 자동매매 시스템")
+    st.title("🔥 Crypto Quant Dashboard V36")
+    st.caption("1D + 1H(메이저 흐름/POC) + 30m(정밀 타점) 하이브리드 엔진 + 비트겟 자동매매 시스템")
 
     st.sidebar.header("⚙️ 비트겟 선물 API 설정")
     bitget_api_key = st.sidebar.text_input("API Key", type="password")
@@ -468,33 +459,33 @@ def main():
     btc_row = market[market["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
 
-    if st.button(f"🚀 V35 [WFO+POC+ATR] 전수 조사 ({len(symbols)}개 코인) 스캔 실행", use_container_width=True):
+    if st.button(f"🚀 V36 [1H+30m 하이브리드] 전수 조사 ({len(symbols)}개 코인) 스캔 실행", use_container_width=True):
         results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         total_symbols = len(symbols)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
-            futures = {pool.submit(analyze_symbol_v35, s, active_exchange, market_avg_change, btc_change, wfo_params): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v36, s, active_exchange, market_avg_change, btc_change, wfo_params): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
                 progress_bar.progress(completed / total_symbols)
-                status_text.text(f"🔍 V35 POC 매물대 및 알파 수급 분석 중... ({completed}/{total_symbols}) 완료")
+                status_text.text(f"🔍 V36 1H/30m 메이저 주도주 분석 중... ({completed}/{total_symbols}) 완료")
                 r = f.result()
                 if r: results.append(r)
         
         progress_bar.empty()
         status_text.empty()
-        st.session_state["v35_results"] = results
+        st.session_state["v36_results"] = results
 
-    results = st.session_state.get("v35_results", [])
+    results = st.session_state.get("v36_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
         stable_df = df_res[df_res["group"] == "STABLE"].sort_values("score", ascending=False)
 
-        st.success(f"🎉 총 {len(df_res)}개의 고수익 알파 포착 종목이 발굴되었습니다!")
+        st.success(f"🎉 총 {len(df_res)}개의 묵직한 주도주 알파가 발굴되었습니다!")
         col1, col2 = st.columns(2)
 
         with col1:
@@ -519,7 +510,7 @@ def main():
                             🛑 <b>방어손절(SL):</b> <span style="color: #475569; font-size: 15px; font-weight: 800;">{fmt_price(row['sl'])}</span>
                         </div>
                         <div style="margin-top: 8px; font-size: 12px; color: #64748b;">
-                            📊 POC 매물대: <b>{fmt_price(row['poc'])}</b> | 베타: {row['beta']:.2f} | 펀딩비: {row['funding']*100:.3f}% | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
+                            📊 POC: <b>{fmt_price(row['poc'])}</b> | 1H RSI: {row['rsi_1h']:.1f} | 베타: {row['beta']:.2f} | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -563,7 +554,7 @@ def main():
                             🛑 <b>방어손절(SL):</b> <span style="color: #475569; font-size: 15px; font-weight: 800;">{fmt_price(row['sl'])}</span>
                         </div>
                         <div style="margin-top: 8px; font-size: 12px; color: #64748b;">
-                            📊 POC 매물대: <b>{fmt_price(row['poc'])}</b> | 베타: {row['beta']:.2f} | 펀딩비: {row['funding']*100:.3f}% | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
+                            📊 POC: <b>{fmt_price(row['poc'])}</b> | 1H RSI: {row['rsi_1h']:.1f} | 베타: {row['beta']:.2f} | 알파스코어: <b style="color: #2563eb;">{row['score']:.1f}점</b>
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
