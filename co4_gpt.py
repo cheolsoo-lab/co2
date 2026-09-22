@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V5
+Crypto Quant Dashboard V6
+- Main Screen Macro Regime Bar Restored (BTC, Dominance, Total2/3 Flow)
 - Intuitive Long (🟢) vs Short (🔴) Visual Separation
-- Explicit TP, SL, and Entry Price Cards for Recommended Coins
-- Multi-Exchange Fallback, Dynamic ATR TP Extension, ML Ensemble, Hierarchical MTF
+- Explicit TP, SL, and Entry Price Cards
+- Aggressive (Trend) vs Defensive (Reversal) Tab Separation
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ from sklearn.linear_model import LogisticRegression
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V5",
+    page_title="🔥 Crypto Quant Dashboard V6",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -50,7 +51,7 @@ class BacktestConfig:
 
 
 # ============================================================
-# 1. DATA ACCESS & MULTI-EXCHANGE FALLBACK
+# 1. DATA ACCESS & MACRO REGIME ANALYSIS
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -140,6 +141,30 @@ def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d",
         except Exception:
             continue
     return pd.DataFrame(), ""
+
+
+def render_macro_regime_bar(market_df: pd.DataFrame):
+    """메인 상단 글로벌 매크로 분석 (BTC 추세, 유동성 흐름 직관적 요약)"""
+    btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
+    btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
+    
+    # 상위 알트 및 시총 지표 프록시 분석
+    total_vol = market_df["quote_volume"].sum()
+    majors_vol = market_df[market_df["base"].isin(["BTC", "ETH"])]["quote_volume"].sum()
+    btc_dominance_proxy = (majors_vol / total_vol) * 100 if total_vol > 0 else 50.0
+
+    if btc_change > 2.0:
+        market_env = "🟢 Risk-On (BTC 주도 상승장)"
+    elif btc_change < -2.0:
+        market_env = "🔴 Risk-Off (시장 하락/방어 필요)"
+    else:
+        market_env = "🟡 횡보/눈치보기 장세 (선별적 접근)"
+
+    st.markdown(
+        f"**🌐 글로벌 매크로 레짐** | 상태: **{market_env}** | "
+        f"BTC 24H 변동: **{btc_change:+.2f}%** | "
+        f"메이저 집중도(도미넌스 프록시): **{btc_dominance_proxy:.1f}%**"
+    )
 
 
 # ============================================================
@@ -334,7 +359,7 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
 
 
 # ============================================================
-# 7. STREAMLIT UI (직관적 롱/숏 분리 및 TP/SL 카드 렌더링)
+# 7. STREAMLIT UI (매크로 분석바 + 한줄 간략 정리 적용)
 # ============================================================
 
 def fmt_price(x):
@@ -344,8 +369,8 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V5")
-    st.caption("공격형(대세 추종 알파) & 방어형(숏컷 헌터) 멀티 매매판 (TP / SL 표기)")
+    st.title("🔥 Crypto Quant Dashboard V6")
+    st.caption("글로벌 매크로 레짐 분석 탑재 · 공격형/방어형 분리 매매판")
 
     with st.sidebar:
         st.header("⚙️ 설정")
@@ -359,6 +384,10 @@ def main():
     else:
         st.caption(f"데이터 연동 성공 거래소: **{active_exchange.upper()}**")
 
+    # 상단 글로벌 매크로 레짐 바 렌더링
+    render_macro_regime_bar(market)
+    st.divider()
+
     universe = market[market["quote_volume"] >= min_volume].sort_values("quote_volume", ascending=False).head(20)
     symbols = universe["symbol"].tolist()
 
@@ -369,9 +398,9 @@ def main():
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v5_results"] = results
+        st.session_state["v6_results"] = results
 
-    results = st.session_state.get("v5_results", [])
+    results = st.session_state.get("v6_results", [])
     if results:
         df_res = pd.DataFrame(results)
         
@@ -386,24 +415,14 @@ def main():
             for _, row in agg_rows.iterrows():
                 sig = row["signal"]
                 is_long = row["direction"] == "LONG"
+                badge = "🟢 **LONG**" if is_long else "🔴 **SHORT**"
                 
-                # 🟢 롱과 숏의 직관적인 디자인 분기 (컨테이너 및 뱃지)
-                badge = "🟢 **LONG (매수)**" if is_long else "🔴 **SHORT (매도)**"
-                
-                with st.container(border=True):
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.markdown(f"### {row['symbol']}")
-                    col2.markdown(f"방향: {badge}")
-                    col3.metric("앙상블 점수", f"{row['score']:.1f}")
-                    col4.metric("손익비 (R:R)", f"1 : {sig['rr']:.2f}")
-
-                    # TP, SL, 진입가 명확한 박스 분리 표기
-                    t1, t2, t3 = st.columns(3)
-                    t1.metric("🎯 목표가 (TP)", fmt_price(sig['tp']))
-                    t2.metric("🛑 손절가 (SL)", fmt_price(sig['sl']))
-                    t3.metric("⚡ 진입 구간", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
-                    
-                    st.caption(f"상세 사유: {row['reason']}")
+                # 가독성을 극대화한 한줄 간략 정리 포맷
+                st.markdown(
+                    f"🔥 **{row['symbol']}** | {badge} | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                    f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
+                    f"점수: {row['score']:.1f} | R:R: 1:{sig['rr']:.2f}"
+                )
 
         with tab2:
             st.markdown("### 🛡️ 방어형 숏컷 헌터 포지션 (짧은 익절 / 칼손절)")
@@ -414,22 +433,13 @@ def main():
             for _, row in def_rows.iterrows():
                 sig = row["signal"]
                 is_long = row["direction"] == "LONG"
+                badge = "🟢 **LONG**" if is_long else "🔴 **SHORT**"
                 
-                badge = "🟢 **LONG (매수)**" if is_long else "🔴 **SHORT (매도)**"
-                
-                with st.container(border=True):
-                    col1, col2, col3, col4 = st.columns(4)
-                    col1.markdown(f"### {row['symbol']}")
-                    col2.markdown(f"방향: {badge}")
-                    col3.metric("앙상블 점수", f"{row['score']:.1f}")
-                    col4.metric("손익비 (R:R)", f"1 : {sig['rr']:.2f}")
-
-                    t1, t2, t3 = st.columns(3)
-                    t1.metric("🎯 목표가 (TP)", fmt_price(sig['tp']))
-                    t2.metric("🛑 손절가 (SL)", fmt_price(sig['sl']))
-                    t3.metric("⚡ 진입 구간", f"{fmt_price(sig['entry_low'])} ~ {fmt_price(sig['entry_high'])}")
-                    
-                    st.caption(f"상세 사유: {row['reason']} | 펀딩비: {row['funding_rate']*100:.4f}%")
+                st.markdown(
+                    f"🛡️ **{row['symbol']}** | {badge} | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                    f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
+                    f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
+                )
 
 
 if __name__ == "__main__":
