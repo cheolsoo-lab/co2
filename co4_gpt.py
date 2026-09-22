@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V12
-- UI/UX Refined & Clean Formatting
-- Dual-Horizon Engine (Short-Term Momentum vs Long-Term Macro Trend)
-- Position Lifetime Decision Matrix (Hold vs Rotate Guide)
+Crypto Quant Dashboard V13
+- Macro Horizon Decision Engine (Market-Wide Short-Term vs Long-Term Direction)
+- Clean, Unified Dashboard Layout
 """
 
 from __future__ import annotations
@@ -24,38 +23,38 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V12",
+    page_title="🔥 Crypto Quant Dashboard V13",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-# Custom CSS for clean UI cards and layout
 st.markdown("""
 <style>
+    .macro-box {
+        background: linear-gradient(135deg, #1e2530 0%, #111827 100%);
+        border: 1px solid #374151;
+        padding: 20px;
+        border-radius: 12px;
+        margin-bottom: 20px;
+    }
     .metric-card {
         background-color: #1e2530;
         border: 1px solid #2d3748;
-        padding: 15px;
-        border-radius: 10px;
-        margin-bottom: 10px;
+        padding: 12px 15px;
+        border-radius: 8px;
+        margin-bottom: 8px;
     }
-    .badge-long { background-color: #0d9488; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; }
-    .badge-short { background-color: #e11d48; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; }
+    .badge-long { background-color: #0d9488; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; font-size: 11px; }
+    .badge-short { background-color: #e11d48; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; font-size: 11px; }
 </style>
 """, unsafe_allow_html=True)
 
 DEFAULT_EXCHANGES = ["binance", "bybit", "mexc", "gateio"]
 
-@dataclass(frozen=True)
-class BacktestConfig:
-    fee_rate: float = 0.0005
-    slippage_rate: float = 0.0005
-    account_size: float = 10000.0
-
 
 # ============================================================
-# 1. DATA ACCESS & 4D INTERMARKET MACRO ENGINE
+# 1. DATA ACCESS & MARKET-WIDE HORIZON ENGINE
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -99,7 +98,7 @@ def fetch_tickers_with_fallback() -> tuple[pd.DataFrame, str]:
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d", limit: int = 700) -> pd.DataFrame:
+def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d", limit: int = 300) -> pd.DataFrame:
     ex = make_exchange(exchange_id)
     raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     if not raw:
@@ -113,10 +112,18 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d", limit: int
     df = df.dropna().drop_duplicates("timestamp").sort_values("timestamp")
     if len(df) > 2:
         df = df.iloc[:-1].copy()
-    return add_indicators(df)
+    
+    # 지표 계산
+    df["EMA20"] = ta.trend.EMAIndicator(df["Close"], window=20).ema_indicator()
+    df["EMA50"] = ta.trend.EMAIndicator(df["Close"], window=50).ema_indicator()
+    df["RSI14"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
+    df["ATR14"] = ta.volatility.AverageTrueRange(df["High"], df["Low"], df["Close"], window=14).average_true_range()
+    df["VOL_MA20"] = df["Volume"].rolling(20).mean()
+    df["REL_VOLUME"] = df["Volume"] / df["VOL_MA20"]
+    return df
 
 
-def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d", limit: int = 700) -> tuple[pd.DataFrame, str]:
+def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d", limit: int = 300) -> tuple[pd.DataFrame, str]:
     for exchange_id in DEFAULT_EXCHANGES:
         try:
             df = fetch_ohlcv(exchange_id, symbol, timeframe, limit)
@@ -127,7 +134,11 @@ def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d", limit: int = 700) -
     return pd.DataFrame(), ""
 
 
-def analyze_4d_macro_matrix(market_df: pd.DataFrame) -> dict:
+def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
+    """
+    전체 시장의 자금 흐름(BTC, 알트 점유율, 변동성)을 분석하여
+    시장 전체가 '장기 홀딩' 장세인지 '단기 스캘핑/회전' 장세인지 판정합니다.
+    """
     btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
     
@@ -140,142 +151,106 @@ def analyze_4d_macro_matrix(market_df: pd.DataFrame) -> dict:
     alt_share = (alt_vol / total_vol) * 100 if total_vol > 0 else 50.0
     avg_change = market_df["change_pct"].mean()
 
+    # 시장 국면 및 전체 방향성 판정
     if btc_dom < 48.0 and alt_share > 45.0 and avg_change > 0.5:
-        pattern = "🚀 본질적 알트 불장 (Altcoin Season)"
-        bias = "LONG"
+        market_phase = "🚀 대세 알트 불장 (Altcoin Season)"
+        horizon_strategy = "LONG_HOLD"
+        market_advice = "시장 전체로 자금이 밀려 들어오는 **강력한 장기 홀딩(Long-term Hold) 장세**입니다. 중간에 잔파도에 흔들리지 말고 주요 코인들을 목표가(TP)까지 길게 끌고 가며 수익을 극대화하세요."
         portfolio = {"BTC": 10, "Major Alt": 30, "Small/Mid Alt": 50, "Cash": 10}
-        strategy_desc = "알트로 자금 대이동 발생. 순수 알트 홀딩 강력 추천 (목표가까지 장기 보유 유리)"
     elif btc_dom >= 52.0 and btc_change > 1.0:
-        pattern = "⚡ 비트코인 독주장 (BTC Dominance)"
-        bias = "LONG"
+        market_phase = "⚡ 비트코인 독주장 (BTC Dominance Rally)"
+        horizon_strategy = "LONG_HOLD_BTC"
+        market_advice = "오직 비트코인만 수급을 독식하고 있습니다. 알트코인은 장기 보유를 금지하고, **비트코인 위주로만 홀딩**하거나 알트는 짧게 치고 빠지는 **단기 순환매**로만 대응하세요."
         portfolio = {"BTC": 70, "Major Alt": 15, "Small/Mid Alt": 5, "Cash": 10}
-        strategy_desc = "오직 비트만 상승. 알트는 단기 스캘핑 외 장기 홀딩 금지"
     elif btc_change < -1.5 or avg_change < -1.0:
-        pattern = "🩸 현금 대피장 (Risk-Off)"
-        bias = "SHORT"
+        market_phase = "🩸 리스크오프 및 현금 대피장 (Risk-Off)"
+        horizon_strategy = "DEFENSIVE_CASH"
+        market_advice = "시장 전체가 하락 압력을 받으며 테더(현금)로 자금이 대피 중입니다. 모든 장기 홀딩을 중단하고 **현금화 및 철저한 단기 방어(또는 숏)** 관점으로만 임하세요."
         portfolio = {"BTC": 0, "Major Alt": 0, "Small/Mid Alt": 0, "Cash": 100}
-        strategy_desc = "자금 이탈 중. 신규 진입 자제 및 현금 100% 방어"
     else:
-        pattern = "⚖️ 방향성 탐색 횡보장"
-        bias = "NEUTRAL"
+        market_phase = "⚖️ 방향성 없는 횡보/눈치보기 장세 (Range Bound)"
+        horizon_strategy = "SHORT_ROTATE"
+        market_advice = "주도 세력이 부재하여 지루한 박스권이 이어지고 있습니다. 장기 홀딩은 시간 손실을 유발하므로, 목표가 도달 시 **즉시 익절하고 새로운 수급 종목으로 갈아타는 단기 순환매(Short-term Rotation)** 전략이 필수적입니다."
         portfolio = {"BTC": 30, "Major Alt": 30, "Small/Mid Alt": 10, "Cash": 30}
-        strategy_desc = "확실한 주도 세력 부재. 짧게 먹고 빠지는 단기 관점만 유효"
 
     return {
-        "pattern": pattern, "bias": bias, "btc_change": btc_change,
-        "btc_dom": btc_dom, "alt_share": alt_share,
-        "portfolio": portfolio, "strategy_desc": strategy_desc
+        "market_phase": market_phase,
+        "horizon_strategy": horizon_strategy,
+        "market_advice": market_advice,
+        "btc_change": btc_change,
+        "btc_dom": btc_dom,
+        "alt_share": alt_share,
+        "portfolio": portfolio
     }
 
 
-def render_macro_dashboard(market_df: pd.DataFrame):
-    macro = analyze_4d_macro_matrix(market_df)
+def render_market_horizon_dashboard(market_df: pd.DataFrame):
+    m = analyze_market_wide_horizon(market_df)
     
-    st.markdown("### 🌐 4차원 인터마켓 매크로 매트릭스")
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("시장 판정 국면", macro["pattern"].split(" ")[1])
-    with col2:
-        st.metric("BTC 24H 변동", f"{macro['btc_change']:+.2f}%")
-    with col3:
-        st.metric("BTC 도미넌스(추정)", f"{macro['btc_dom']:.1f}%")
-    with col4:
-        st.metric("알트 자금 점유율", f"{macro['alt_share']:.1f}%")
-        
-    st.info(f"💡 **매크로 트레이딩 가이드:** {macro['strategy_desc']}")
+    st.markdown(f"""
+    <div class="macro-box">
+        <h2 style="margin-top:0; color:#38bdf8;">🌐 시장 전체 매크로 방향성 & 홀딩 가이드</h2>
+        <hr style="border-color: #374151;">
+        <h3 style="color: #f43f5e; margin-bottom: 10px;">현재 판정: {m['market_phase']}</h3>
+        <p style="font-size: 16px; line-height: 1.6; color: #e2e8f0;">
+            {m['market_advice']}
+        </p>
+        <hr style="border-color: #374151; margin: 15px 0;">
+        <div style="display: flex; gap: 20px; font-size: 14px; color: #94a3b8;">
+            <div>₿ BTC 24H: <b>{m['btc_change']:+.2f}%</b></div>
+            <div>📊 BTC 도미넌스: <b>{m['btc_dom']:.1f}%</b></div>
+            <div>🚀 알트 자금 점유율: <b>{m['alt_share']:.1f}%</b></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Capital Allocation Visual
-    p = macro["portfolio"]
-    st.markdown(f"💰 **추천 자금 배분:** BTC `{p['BTC']}%` | 메이저알트 `{p['Major Alt']}%` | 중소알트 `{p['Small/Mid Alt']}%` | 현금 `{p['Cash']}%`")
+    p = m["portfolio"]
+    st.markdown(f"💰 **권장 자금 배분:** BTC `{p['BTC']}%` | 메이저알트 `{p['Major Alt']}%` | 중소알트 `{p['Small/Mid Alt']}%` | 현금 `{p['Cash']}%`")
     st.divider()
-    return macro["bias"], macro["pattern"]
+    return m["horizon_strategy"]
 
 
 # ============================================================
-# 2. INDICATORS & DUAL HORIZON ENGINE
+# 2. INDIVIDUAL COIN ANALYSIS (UNIFIED)
 # ============================================================
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    x = df.copy()
-    x["EMA20"] = ta.trend.EMAIndicator(x["Close"], window=20).ema_indicator()
-    x["EMA50"] = ta.trend.EMAIndicator(x["Close"], window=50).ema_indicator()
-    x["EMA200"] = ta.trend.EMAIndicator(x["Close"], window=200).ema_indicator()
-    x["RSI14"] = ta.momentum.RSIIndicator(x["Close"], window=14).rsi()
-    x["ADX14"] = ta.trend.ADXIndicator(x["High"], x["Low"], x["Close"], window=14).adx()
-    x["ATR14"] = ta.volatility.AverageTrueRange(x["High"], x["Low"], x["Close"], window=14).average_true_range()
-    x["VOL_MA20"] = x["Volume"].rolling(20).mean()
-    x["REL_VOLUME"] = x["Volume"] / x["VOL_MA20"]
-    x["SWING_HIGH"] = x["High"].rolling(10, center=False).max().shift(1)
-    x["SWING_LOW"] = x["Low"].rolling(10, center=False).min().shift(1)
-    
-    candle_range = x["High"] - x["Low"]
-    body_size = (x["Close"] - x["Open"]).abs()
-    x["BODY_RATIO"] = np.where(candle_range > 0, body_size / candle_range, 0.0)
-    return x
-
-
-def analyze_symbol_dual_horizon(symbol: str, macro_bias: str, macro_pattern: str) -> Optional[dict]:
+def analyze_symbol_unified(symbol: str, horizon_strategy: str) -> Optional[dict]:
     try:
-        # 단기용 4시간봉, 장기용 1일봉 데이터 동시 수집
-        df_1d, ex_id = fetch_ohlcv_fallback(symbol, "1d", 300)
-        df_4h, _ = fetch_ohlcv_fallback(symbol, "4h", 300)
-        if len(df_1d) < 100 or len(df_4h) < 100:
+        df, ex_id = fetch_ohlcv_fallback(symbol, "1d", 200)
+        if len(df) < 100:
             return None
 
-        r_1d = df_1d.iloc[-1]
-        r_4h = df_4h.iloc[-1]
-        
-        close = float(r_1d["Close"])
-        atr_1d = float(r_1d["ATR14"])
-        
-        # --- 1. 단기 관점 분석 (4시간봉 모멘텀 스윙) ---
-        short_rsi = float(r_4h["RSI14"])
-        short_rel_vol = float(r_4h["REL_VOLUME"]) if pd.notna(r_4h["REL_VOLUME"]) else 1.0
-        short_dir = "LONG" if r_4h["Close"] > r_4h["EMA20"] else "SHORT"
-        short_tp = close + (2.0 * atr_1d) if short_dir == "LONG" else close - (2.0 * atr_1d)
-        short_sl = close - (1.0 * atr_1d) if short_dir == "LONG" else close + (1.0 * atr_1d)
+        r = df.iloc[-1]
+        close = float(r["Close"])
+        atr = float(r["ATR14"])
+        rsi = float(r["RSI14"])
+        rel_vol = float(r["REL_VOLUME"]) if pd.notna(r["REL_VOLUME"]) else 1.0
 
-        # --- 2. 장기 관점 분석 (1일봉 매크로 트렌드) ---
-        long_trend_up = close > r_1d["EMA50"] and r_1d["EMA50"] > r_1d["EMA200"]
-        long_dir = "LONG" if long_trend_up else "SHORT"
-        long_tp = close + (5.0 * atr_1d) if long_dir == "LONG" else close - (5.0 * atr_1d)
-        long_sl = close - (2.0 * atr_1d) if long_dir == "LONG" else close + (2.0 * atr_1d)
-
-        # --- 3. 홀딩 가이드 (오래 들고 갈까 vs 회전시킬까) ---
-        # 매크로 패턴이 불장이거나 장기 이평선 정배열이면 '장기 홀딩' 추천
-        if "불장" in macro_pattern and long_trend_up:
-            holding_advice = "🚀 **장기 홀딩 추천** (대세 상승장: TP 상단까지 분할 익절하며 길게 가져가세요)"
-            action_type = "LONG_HOLD"
-        elif "비트코인 독주" in macro_pattern and "BTC" in symbol:
-            holding_advice = "⚡ **비트 장기 홀딩** (독주장 수혜주: 비트코인 중심 메인 홀딩)"
-            action_type = "LONG_HOLD"
-        elif "횡보" in macro_pattern:
-            holding_advice = "🔄 **단기 회전(스캘핑) 추천** (횡보장: 목표가 도달 시 즉시 익절 후 순환 코인 교체)"
-            action_type = "SHORT_ROTATE"
+        # 시장 전체 전략에 따른 매매 방향 결정
+        if horizon_strategy in {"LONG_HOLD", "LONG_HOLD_BTC"}:
+            direction = "LONG"
+            tp = close + (4.0 * atr)  # 불장에서는 목표가를 멀게 잡고 장기 홀딩 유도
+            sl = close - (1.5 * atr)
+        elif horizon_strategy == "SHORT_ROTATE":
+            direction = "LONG" if close > r["EMA20"] else "SHORT"
+            tp = close + (2.0 * atr)  # 횡보장에서는 짧게 먹고 회전
+            sl = close - (1.0 * atr)
         else:
-            holding_advice = "⚖️ **목표가 도달 시 절반 익절 후 추적 관찰**"
-            action_type = "FLEXIBLE"
+            direction = "SHORT"
+            tp = close - (2.0 * atr)
+            sl = close + (1.0 * atr)
 
-        score = float(np.clip(r_1d["ADX14"] * 0.7 + short_rel_vol * 10, 0, 100))
+        score = float(np.clip(rel_vol * 15 + (50 if direction == "LONG" else 30), 0, 100))
 
         return {
             "symbol": symbol,
             "exchange": ex_id.upper(),
             "price": close,
-            "score": score,
-            "action_type": action_type,
-            "holding_advice": holding_advice,
-            # 단기 데이터
-            "short_dir": short_dir,
-            "short_tp": short_tp,
-            "short_sl": short_sl,
-            "short_rsi": short_rsi,
-            # 장기 데이터
-            "long_dir": long_dir,
-            "long_tp": long_tp,
-            "long_sl": long_sl,
+            "direction": direction,
+            "tp": tp,
+            "sl": sl,
+            "rsi": rsi,
+            "score": score
         }
     except Exception:
         return None
@@ -292,52 +267,58 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V12")
-    st.caption("단기 스윙 vs 장기 홀딩 전략 및 자금 회전 가이드 시스템")
+    st.title("🔥 Crypto Quant Dashboard V13")
+    st.caption("시장 전체 거시 방향성 기반 [장기 홀딩 vs 단기 순환매] 통합 의사결정 시스템")
 
     market, active_exchange = fetch_tickers_with_fallback()
     if market.empty:
-        st.error("거래소 시세 데이터를 불러오지 못했습니다.")
+        st.error("거래소 시세를 불러오지 못했습니다.")
         return
 
-    # 4D 매크로 분석
-    macro_bias, macro_pattern = render_macro_dashboard(market)
+    # 1. 시장 전체 거시 방향성 및 홀딩 가이드 출력
+    horizon_strategy = render_market_horizon_dashboard(market)
 
-    # 상위 종목 필터링
+    # 2. 주요 종목 스캔
     universe = market[market["quote_volume"] >= 2_000_000].sort_values("quote_volume", ascending=False).head(15)
     symbols = universe["symbol"].tolist()
 
-    if st.button("🔍 듀얼 호라이즌(단기/장기) 정밀 분석 시작", use_container_width=True):
+    if st.button("🔍 시장 맞춤형 추천 종목 스캔 실행", use_container_width=True):
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-            futures = [pool.submit(analyze_symbol_dual_horizon, s, macro_bias, macro_pattern) for s in symbols]
+            futures = [pool.submit(analyze_symbol_unified, s, horizon_strategy) for s in symbols]
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v12_results"] = results
+        st.session_state["v13_results"] = results
 
-    results = st.session_state.get("v12_results", [])
+    results = st.session_state.get("v13_results", [])
     if results:
         df_res = pd.DataFrame(results).sort_values("score", ascending=False)
 
-        st.markdown("### 📋 추천 코인 종합 분석 브리핑 (카드형 뷰)")
-        st.caption("💡 각 종목카드를 통해 **단기 관점(빠른 익절 후 순환)**과 **장기 관점(목표 TP까지 홀딩)**을 한눈에 비교할 수 있습니다.")
+        st.markdown("### 📋 시장 국면 맞춤형 추천 종목 리스트")
+        st.caption("💡 현재 시장 전체 방향성에 맞춰 산출된 목표가(TP)와 손절가(SL)입니다.")
 
         for _, row in df_res.iterrows():
-            badge_class = "badge-long" if row["short_dir"] == "LONG" else "badge-short"
-            
-            with st.container():
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h4><b>{row['symbol']}</b> <span style="font-size:12px; color:#a0aec0;">({row['exchange']})</span> &nbsp; <span class="{badge_class}">{row['short_dir']}</span> &nbsp; <b>현재가:</b> {fmt_price(row['price'])} &nbsp; <b>퀀트점수:</b> {row['score']:.1f}점</h4>
-                    <hr style="margin: 5px 0 10px 0; border-color: #2d3748;">
-                    <b>⚡ [단기 관점 - 4시간봉 스윙]</b><br>
-                    &nbsp;&nbsp;• 목표가(TP): <code>{fmt_price(row['short_tp'])}</code> &nbsp;|&nbsp; 손절가(SL): <code>{fmt_price(row['short_sl'])}</code> &nbsp;|&nbsp; RSI: <code>{row['short_rsi']:.1f}</code><br><br>
-                    <b>📈 [장기 관점 - 1일봉 매크로 트렌드]</b><br>
-                    &nbsp;&nbsp;• 대세 목표가(TP): <code>{fmt_price(row['long_tp'])}</code> &nbsp;|&nbsp; 대세 손절가(SL): <code>{fmt_price(row['long_sl'])}</code><br><br>
-                    📌 <b>운영 가이드:</b> {row['holding_advice']}
+            badge = "badge-long" if row["direction"] == "LONG" else "badge-short"
+            st.markdown(f"""
+            <div class="metric-card">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div>
+                        <span class="{badge}">{row['direction']}</span> &nbsp;
+                        <b style="font-size: 16px;">{row['symbol']}</b> 
+                        <span style="font-size: 12px; color: #94a3b8;">({row['exchange']})</span>
+                    </div>
+                    <div>
+                        <b>현재가:</b> {fmt_price(row['price'])} &nbsp;|&nbsp; <b>점수:</b> {row['score']:.1f}점
+                    </div>
                 </div>
-                """, unsafe_allow_html=True)
+                <div style="margin-top: 8px; font-size: 13px; color: #cbd5e1;">
+                    🎯 <b>목표가(TP):</b> <code>{fmt_price(row['tp'])}</code> &nbsp;&nbsp;|&nbsp;&nbsp; 
+                    🛑 <b>손절가(SL):</b> <code>{fmt_price(row['sl'])}</code> &nbsp;&nbsp;|&nbsp;&nbsp; 
+                    📊 <b>RSI:</b> {row['rsi']:.1f}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
