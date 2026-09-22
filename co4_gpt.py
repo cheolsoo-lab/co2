@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V11
-- 4-Dimension Intermarket Macro Matrix (BTC, BTC.D, USDT.D, Total3)
-- Dynamic Capital Allocation Engine (Auto Portfolio Weighting)
-- Regime-Gated Multi-Mode Signal Alignment
+Crypto Quant Dashboard V12
+- UI/UX Refined & Clean Formatting
+- Dual-Horizon Engine (Short-Term Momentum vs Long-Term Macro Trend)
+- Position Lifetime Decision Matrix (Hold vs Rotate Guide)
 """
 
 from __future__ import annotations
@@ -16,36 +16,42 @@ from typing import Optional
 import ccxt
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import streamlit as st
 import ta
 
-
 # ============================================================
-# 0. APP CONFIG
+# 0. APP CONFIG & STYLING
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V11",
+    page_title="🔥 Crypto Quant Dashboard V12",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
-DEFAULT_EXCHANGES = ["binance", "bybit", "mexc", "gateio"]
+# Custom CSS for clean UI cards and layout
+st.markdown("""
+<style>
+    .metric-card {
+        background-color: #1e2530;
+        border: 1px solid #2d3748;
+        padding: 15px;
+        border-radius: 10px;
+        margin-bottom: 10px;
+    }
+    .badge-long { background-color: #0d9488; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; }
+    .badge-short { background-color: #e11d48; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
 
+DEFAULT_EXCHANGES = ["binance", "bybit", "mexc", "gateio"]
 
 @dataclass(frozen=True)
 class BacktestConfig:
     fee_rate: float = 0.0005
     slippage_rate: float = 0.0005
-    spread_rate: float = 0.0002
-    max_holding_bars: int = 15
-    min_oos_trades: int = 5
     account_size: float = 10000.0
-    risk_per_trade: float = 0.0075
-    max_portfolio_risk: float = 0.02
-    max_position_weight: float = 0.40
 
 
 # ============================================================
@@ -92,32 +98,14 @@ def fetch_tickers_with_fallback() -> tuple[pd.DataFrame, str]:
     return pd.DataFrame(), ""
 
 
-@st.cache_data(ttl=30, show_spinner=False)
-def fetch_funding_rate(exchange_id: str, symbol: str) -> float:
-    try:
-        ex = make_exchange(exchange_id)
-        if hasattr(ex, 'fetch_funding_rate'):
-            fr = ex.fetch_funding_rate(symbol)
-            rate = fr.get('fundingRate')
-            if rate is not None:
-                return float(rate)
-    except Exception:
-        pass
-    return 0.0
-
-
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d",
-                limit: int = 700) -> pd.DataFrame:
+def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d", limit: int = 700) -> pd.DataFrame:
     ex = make_exchange(exchange_id)
     raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     if not raw:
         return pd.DataFrame()
 
-    df = pd.DataFrame(
-        raw,
-        columns=["timestamp", "Open", "High", "Low", "Close", "Volume"]
-    )
+    df = pd.DataFrame(raw, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
     for c in ["Open", "High", "Low", "Close", "Volume"]:
         df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -125,12 +113,10 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d",
     df = df.dropna().drop_duplicates("timestamp").sort_values("timestamp")
     if len(df) > 2:
         df = df.iloc[:-1].copy()
-
     return add_indicators(df)
 
 
-def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d",
-                         limit: int = 700) -> tuple[pd.DataFrame, str]:
+def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d", limit: int = 700) -> tuple[pd.DataFrame, str]:
     for exchange_id in DEFAULT_EXCHANGES:
         try:
             df = fetch_ohlcv(exchange_id, symbol, timeframe, limit)
@@ -142,10 +128,6 @@ def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d",
 
 
 def analyze_4d_macro_matrix(market_df: pd.DataFrame) -> dict:
-    """
-    BTC, BTC.D(프록시), USDT.D(프록시 변동성), Total3(알트 거래대금 점유율)를 
-    복합 교차 분석하여 시장 국면을 진단하고 자금 배분을 결정합니다.
-    """
     btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
     
@@ -154,80 +136,63 @@ def analyze_4d_macro_matrix(market_df: pd.DataFrame) -> dict:
     eth_vol = market_df[market_df["base"] == "ETH"]["quote_volume"].sum()
     alt_vol = total_vol - (btc_vol + eth_vol)
     
-    btc_dominance_proxy = (btc_vol / total_vol) * 100 if total_vol > 0 else 50.0
+    btc_dom = (btc_vol / total_vol) * 100 if total_vol > 0 else 50.0
     alt_share = (alt_vol / total_vol) * 100 if total_vol > 0 else 50.0
     avg_change = market_df["change_pct"].mean()
 
-    # 4차원 매트릭스 패턴 분류 및 자금 배분(Portfolio Allocation) 산출
-    # 1. 패턴 A: 진짜 알트 불장 (BTC.D 하락 + 알트 거래량 급증 + 평균 변동률 상승)
-    if btc_dominance_proxy < 48.0 and alt_share > 45.0 and avg_change > 0.5:
-        pattern = "🚀 패턴 A [본격 알트 불장 (Altcoin Season)]"
+    if btc_dom < 48.0 and alt_share > 45.0 and avg_change > 0.5:
+        pattern = "🚀 본질적 알트 불장 (Altcoin Season)"
         bias = "LONG"
         portfolio = {"BTC": 10, "Major Alt": 30, "Small/Mid Alt": 50, "Cash": 10}
-        strategy_desc = "비트코인 자금이 알트로 대거 이동 중! 순수 알트코인 및 공격형 롱 포지션에 자금을 최우선 집중하세요."
-
-    # 2. 패턴 B: 비트 독주장 (BTC.D 상승 + BTC 상승 + 알트 정체)
-    elif btc_dominance_proxy >= 52.0 and btc_change > 1.0:
-        pattern = "⚡ 패턴 B [비트코인 홀로 독식장 (BTC Dominance Rally)]"
+        strategy_desc = "알트로 자금 대이동 발생. 순수 알트 홀딩 강력 추천 (목표가까지 장기 보유 유리)"
+    elif btc_dom >= 52.0 and btc_change > 1.0:
+        pattern = "⚡ 비트코인 독주장 (BTC Dominance)"
         bias = "LONG"
         portfolio = {"BTC": 70, "Major Alt": 15, "Small/Mid Alt": 5, "Cash": 10}
-        strategy_desc = "시장의 돈이 오직 비트코인으로만 쏠리고 있습니다. 알트코인은 철저히 배제하고 BTC 위주로만 대응하세요."
-
-    # 3. 패턴 C: 현금 대피장 (시장 전반 하락 + 테더 선호 심리)
+        strategy_desc = "오직 비트만 상승. 알트는 단기 스캘핑 외 장기 홀딩 금지"
     elif btc_change < -1.5 or avg_change < -1.0:
-        pattern = "🩸 패턴 C [현금 대피 및 리스크오프 (Risk-Off / Capital Flight)]"
+        pattern = "🩸 현금 대피장 (Risk-Off)"
         bias = "SHORT"
         portfolio = {"BTC": 0, "Major Alt": 0, "Small/Mid Alt": 0, "Cash": 100}
-        strategy_desc = "자금이 시장을 이탈하여 현금(테더)으로 대피 중입니다. 모든 롱 포지션을 중단하고 숏 또는 현금 100%를 유지하세요."
-
-    # 4. 패턴 D: 메이저 알트 수급 장세
-    elif eth_vol > btc_vol * 0.6:
-        pattern = "💎 패턴 D [이더리움 및 메이저 알트 수급 장세]"
-        bias = "LONG"
-        portfolio = {"BTC": 20, "Major Alt": 60, "Small/Mid Alt": 10, "Cash": 10}
-        strategy_desc = "잡코인보다는 시총 상위 메이저 알트코인 위주로 수급이 탄탄하게 유입되고 있습니다."
-
-    # 5. 패턴 E: 방향성 탐색 횡보장
+        strategy_desc = "자금 이탈 중. 신규 진입 자제 및 현금 100% 방어"
     else:
-        pattern = "⚖️ 패턴 E [방향성 탐색 횡보/눈치보기 장세]"
+        pattern = "⚖️ 방향성 탐색 횡보장"
         bias = "NEUTRAL"
         portfolio = {"BTC": 30, "Major Alt": 30, "Small/Mid Alt": 10, "Cash": 30}
-        strategy_desc = "확실한 주도 세력이 없는 박스권 장세입니다. 포지션 규모를 대폭 줄이고 보수적으로 접근하세요."
+        strategy_desc = "확실한 주도 세력 부재. 짧게 먹고 빠지는 단기 관점만 유효"
 
     return {
-        "pattern": pattern,
-        "bias": bias,
-        "btc_change": btc_change,
-        "btc_dominance": btc_dominance_proxy,
-        "alt_share": alt_share,
-        "portfolio": portfolio,
-        "strategy_desc": strategy_desc
+        "pattern": pattern, "bias": bias, "btc_change": btc_change,
+        "btc_dom": btc_dom, "alt_share": alt_share,
+        "portfolio": portfolio, "strategy_desc": strategy_desc
     }
 
 
 def render_macro_dashboard(market_df: pd.DataFrame):
     macro = analyze_4d_macro_matrix(market_df)
     
-    st.markdown("### 🌐 4차원 인터마켓 매크로 매트릭스 & 자금 배분 대시보드")
-    st.info(
-        f"**현재 시장 판정 국면:** **{macro['pattern']}**\n\n"
-        f"💡 **실전 트레이딩 가이드:** {macro['strategy_desc']}\n\n"
-        f"💰 **추천 실전 자금 배분 (Portfolio Weighting)**\n"
-        f"• ₿ **BTC 비중**: `{macro['portfolio']['BTC']}%` | "
-        f"🔹 **메이저 알트**: `{macro['portfolio']['Major Alt']}%` | "
-        f"🚀 **중소형 알트**: `{macro['portfolio']['Small/Mid Alt']}%` | "
-        f"💵 **현금 대피**: `{macro['portfolio']['Cash']}%`\n\n"
-        f"---\n"
-        f"📊 **4대 핵심 지표 분석** | "
-        f"BTC 24H: `{macro['btc_change']:+.2f}%` | "
-        f"BTC 독점도(BTC.D): `{macro['btc_dominance']:.1f}%` | "
-        f"알트 자금 점유율(Total3): `{macro['alt_share']:.1f}%`"
-    )
-    return macro["bias"]
+    st.markdown("### 🌐 4차원 인터마켓 매크로 매트릭스")
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("시장 판정 국면", macro["pattern"].split(" ")[1])
+    with col2:
+        st.metric("BTC 24H 변동", f"{macro['btc_change']:+.2f}%")
+    with col3:
+        st.metric("BTC 도미넌스(추정)", f"{macro['btc_dom']:.1f}%")
+    with col4:
+        st.metric("알트 자금 점유율", f"{macro['alt_share']:.1f}%")
+        
+    st.info(f"💡 **매크로 트레이딩 가이드:** {macro['strategy_desc']}")
+    
+    # Capital Allocation Visual
+    p = macro["portfolio"]
+    st.markdown(f"💰 **추천 자금 배분:** BTC `{p['BTC']}%` | 메이저알트 `{p['Major Alt']}%` | 중소알트 `{p['Small/Mid Alt']}%` | 현금 `{p['Cash']}%`")
+    st.divider()
+    return macro["bias"], macro["pattern"]
 
 
 # ============================================================
-# 2. INDICATORS & POC
+# 2. INDICATORS & DUAL HORIZON ENGINE
 # ============================================================
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -238,14 +203,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["EMA50"] = ta.trend.EMAIndicator(x["Close"], window=50).ema_indicator()
     x["EMA200"] = ta.trend.EMAIndicator(x["Close"], window=200).ema_indicator()
     x["RSI14"] = ta.momentum.RSIIndicator(x["Close"], window=14).rsi()
-    x["ROC14"] = ta.momentum.ROCIndicator(x["Close"], window=14).roc()
-
-    macd = ta.trend.MACD(x["Close"])
-    x["MACD_HIST"] = macd.macd_diff()
     x["ADX14"] = ta.trend.ADXIndicator(x["High"], x["Low"], x["Close"], window=14).adx()
     x["ATR14"] = ta.volatility.AverageTrueRange(x["High"], x["Low"], x["Close"], window=14).average_true_range()
-    x["ATR_PCT"] = x["ATR14"] / x["Close"] * 100
-
     x["VOL_MA20"] = x["Volume"].rolling(20).mean()
     x["REL_VOLUME"] = x["Volume"] / x["VOL_MA20"]
     x["SWING_HIGH"] = x["High"].rolling(10, center=False).max().shift(1)
@@ -254,272 +213,131 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     candle_range = x["High"] - x["Low"]
     body_size = (x["Close"] - x["Open"]).abs()
     x["BODY_RATIO"] = np.where(candle_range > 0, body_size / candle_range, 0.0)
-
-    x["POC_Price"] = rolling_poc(x, window=60, bins=20)
     return x
 
 
-def rolling_poc(df: pd.DataFrame, window: int = 60, bins: int = 20) -> pd.Series:
-    values = np.full(len(df), np.nan)
-    closes = df["Close"].to_numpy(float)
-    volumes = df["Volume"].to_numpy(float)
-
-    for i in range(window, len(df)):
-        hist_close = closes[i - window:i]
-        hist_vol = volumes[i - window:i]
-        lo, hi = np.nanmin(hist_close), np.nanmax(hist_close)
-        if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-            continue
-        edges = np.linspace(lo, hi, bins + 1)
-        idx = np.clip(np.digitize(hist_close, edges) - 1, 0, bins - 1)
-        vol_by_bin = np.bincount(idx, weights=hist_vol, minlength=bins)
-        k = int(np.nanargmax(vol_by_bin))
-        values[i] = (edges[k] + edges[k + 1]) / 2
-    return pd.Series(values, index=df.index)
-
-
-# ============================================================
-# 3. HIERARCHICAL MTF & MARKET STATE
-# ============================================================
-
-def fetch_mtf_context(symbol: str) -> dict:
-    result = {}
-    for tf, limit in [("1d", 320), ("4h", 320), ("1h", 320)]:
-        try:
-            df, ex = fetch_ohlcv_fallback(symbol, tf, limit)
-            if len(df) < 220:
-                continue
-            r = df.iloc[-1]
-            result[tf] = {
-                "close": float(r["Close"]), "ema20": float(r["EMA20"]),
-                "ema50": float(r["EMA50"]), "ema200": float(r["EMA200"]),
-                "rsi": float(r["RSI14"]), "adx": float(r["ADX14"])
-            }
-        except Exception:
-            continue
-    return result
-
-
-def classify_market_state(df: pd.DataFrame) -> dict:
-    if len(df) < 220:
-        return {"state": "UNKNOWN", "adx": 0.0, "rsi": 0.0}
-    r = df.iloc[-1]
-    close = float(r["Close"])
-    up = close > r["EMA20"] > r["EMA50"] and r["EMA50"] > r["EMA200"]
-    down = close < r["EMA20"] < r["EMA50"] and r["EMA50"] < r["EMA200"]
-    adx = float(r["ADX14"])
-    rsi = float(r["RSI14"])
-
-    if up and adx >= 22: state = "TREND_UP"
-    elif down and adx >= 22: state = "TREND_DOWN"
-    elif adx < 17: state = "RANGE"
-    else: state = "TRANSITION"
-    return {"state": state, "adx": adx, "rsi": rsi}
-
-
-# ============================================================
-# 4. DYNAMIC ATR TP & SIGNAL GENERATION
-# ============================================================
-
-def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
-                      atr: float, strategy: str, market_state: str) -> dict:
-    if market_state in {"TREND_UP", "TREND_DOWN"} and strategy == "TREND":
-        atr_mults = [3.0, 4.0, 5.0, 6.0]
-    else:
-        atr_mults = [1.5, 2.0, 2.5]
-
-    risk = abs(entry - sl)
-    best_tp = entry + atr_mults[-1] * atr if direction == "LONG" else entry - atr_mults[-1] * atr
-    best_rr = abs(best_tp - entry) / max(risk, 1e-12)
-    return {"tp": float(best_tp), "rr": float(best_rr), "tp_source": "dynamic_atr"}
-
-
-def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) -> Optional[dict]:
-    if len(df) < 220:
-        return None
-    r = df.iloc[-1]
-    
-    rel_vol = float(r["REL_VOLUME"]) if pd.notna(r["REL_VOLUME"]) else 1.0
-    body_ratio = float(r["BODY_RATIO"]) if pd.notna(r["BODY_RATIO"]) else 1.0
-    
-    if rel_vol < 1.15 or body_ratio < 0.35:
-        return None  
-
-    close = float(r["Close"]); atr = float(r["ATR14"])
-    state = classify_market_state(df)
-    
-    score = float(np.clip((r["ADX14"] * 0.5) + (20 if strategy == "TREND" else 10), 0, 100))
-
-    sl_atr = 1.0
-    if direction == "LONG":
-        sl = min(entry := close, float(r["SWING_LOW"]) - 0.25 * atr) if pd.notna(r["SWING_LOW"]) else close - sl_atr * atr
-    else:
-        sl = max(entry := close, float(r["SWING_HIGH"]) + 0.25 * atr) if pd.notna(r["SWING_HIGH"]) else close + sl_atr * atr
-
-    tp_info = select_optimal_tp(df, direction, entry, sl, atr, strategy, state["state"])
-    
-    return {
-        "direction": direction, "strategy": strategy, "score": score,
-        "entry_low": entry * 0.998, "entry_high": entry * 1.002,
-        "tp": tp_info["tp"], "sl": float(sl), "rr": tp_info["rr"],
-        "market_state": state["state"]
-    }
-
-
-# ============================================================
-# 5. SYMBOL ANALYSIS WITH MACRO MATRIX SYNCHRONIZATION
-# ============================================================
-
-def analyze_symbol(symbol: str, macro_bias: str, cfg: BacktestConfig) -> Optional[dict]:
+def analyze_symbol_dual_horizon(symbol: str, macro_bias: str, macro_pattern: str) -> Optional[dict]:
     try:
-        df, exchange_id = fetch_ohlcv_fallback(symbol, "1d", 500)
-        if len(df) < 220:
+        # 단기용 4시간봉, 장기용 1일봉 데이터 동시 수집
+        df_1d, ex_id = fetch_ohlcv_fallback(symbol, "1d", 300)
+        df_4h, _ = fetch_ohlcv_fallback(symbol, "4h", 300)
+        if len(df_1d) < 100 or len(df_4h) < 100:
             return None
-            
-        state = classify_market_state(df)
-        funding_rate = fetch_funding_rate(exchange_id, symbol)
-        mtf = fetch_mtf_context(symbol)
 
-        # 🎯 4차원 매크로 매트릭스 바이어스와 종목 분석 연동
-        if macro_bias == "LONG":
-            direction = "LONG"
-            strategy = "TREND" if state["state"] == "TREND_UP" else "REVERSAL"
-        elif macro_bias == "SHORT":
-            direction = "SHORT"
-            strategy = "TREND" if state["state"] == "TREND_DOWN" else "REVERSAL"
+        r_1d = df_1d.iloc[-1]
+        r_4h = df_4h.iloc[-1]
+        
+        close = float(r_1d["Close"])
+        atr_1d = float(r_1d["ATR14"])
+        
+        # --- 1. 단기 관점 분석 (4시간봉 모멘텀 스윙) ---
+        short_rsi = float(r_4h["RSI14"])
+        short_rel_vol = float(r_4h["REL_VOLUME"]) if pd.notna(r_4h["REL_VOLUME"]) else 1.0
+        short_dir = "LONG" if r_4h["Close"] > r_4h["EMA20"] else "SHORT"
+        short_tp = close + (2.0 * atr_1d) if short_dir == "LONG" else close - (2.0 * atr_1d)
+        short_sl = close - (1.0 * atr_1d) if short_dir == "LONG" else close + (1.0 * atr_1d)
+
+        # --- 2. 장기 관점 분석 (1일봉 매크로 트렌드) ---
+        long_trend_up = close > r_1d["EMA50"] and r_1d["EMA50"] > r_1d["EMA200"]
+        long_dir = "LONG" if long_trend_up else "SHORT"
+        long_tp = close + (5.0 * atr_1d) if long_dir == "LONG" else close - (5.0 * atr_1d)
+        long_sl = close - (2.0 * atr_1d) if long_dir == "LONG" else close + (2.0 * atr_1d)
+
+        # --- 3. 홀딩 가이드 (오래 들고 갈까 vs 회전시킬까) ---
+        # 매크로 패턴이 불장이거나 장기 이평선 정배열이면 '장기 홀딩' 추천
+        if "불장" in macro_pattern and long_trend_up:
+            holding_advice = "🚀 **장기 홀딩 추천** (대세 상승장: TP 상단까지 분할 익절하며 길게 가져가세요)"
+            action_type = "LONG_HOLD"
+        elif "비트코인 독주" in macro_pattern and "BTC" in symbol:
+            holding_advice = "⚡ **비트 장기 홀딩** (독주장 수혜주: 비트코인 중심 메인 홀딩)"
+            action_type = "LONG_HOLD"
+        elif "횡보" in macro_pattern:
+            holding_advice = "🔄 **단기 회전(스캘핑) 추천** (횡보장: 목표가 도달 시 즉시 익절 후 순환 코인 교체)"
+            action_type = "SHORT_ROTATE"
         else:
-            strategy = "TREND" if state["state"] in {"TREND_UP", "TREND_DOWN"} else "REVERSAL"
-            direction = "LONG" if state["state"] == "TREND_UP" else "SHORT"
+            holding_advice = "⚖️ **목표가 도달 시 절반 익절 후 추적 관찰**"
+            action_type = "FLEXIBLE"
 
-        sig = generate_signal(df, direction, mtf, strategy)
-        if not sig:
-            return None
-
-        mode_type = "AGGRESSIVE" if strategy == "TREND" and sig["rr"] >= 2.0 else "DEFENSIVE"
+        score = float(np.clip(r_1d["ADX14"] * 0.7 + short_rel_vol * 10, 0, 100))
 
         return {
-            "symbol": symbol, "exchange": exchange_id, "price": float(df["Close"].iloc[-1]),
-            "direction": direction, "mode_type": mode_type, "signal": sig,
-            "funding_rate": funding_rate, "score": sig["score"],
-            "reason": f"매크로 정렬({macro_bias}) · 레짐 {state['state']} · 펀딩비 {funding_rate*100:.4f}%"
+            "symbol": symbol,
+            "exchange": ex_id.upper(),
+            "price": close,
+            "score": score,
+            "action_type": action_type,
+            "holding_advice": holding_advice,
+            # 단기 데이터
+            "short_dir": short_dir,
+            "short_tp": short_tp,
+            "short_sl": short_sl,
+            "short_rsi": short_rsi,
+            # 장기 데이터
+            "long_dir": long_dir,
+            "long_tp": long_tp,
+            "long_sl": long_sl,
         }
     except Exception:
         return None
 
 
 # ============================================================
-# 6. STREAMLIT UI
+# 3. STREAMLIT UI RENDER
 # ============================================================
 
 def fmt_price(x):
-    if x >= 1000: return f"{x:,.2f}"
-    if x >= 1: return f"{x:,.4f}"
-    return f"{x:,.8f}"
+    if x >= 1000: return f"${x:,.2f}"
+    if x >= 1: return f"${x:,.4f}"
+    return f"${x:,.8f}"
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V11")
-    st.caption("4차원 인터마켓 매크로 매트릭스(BTC·BTC.D·USDT.D·Total3) & 자금 배분 시스템")
-
-    with st.sidebar:
-        st.header("⚙️ 설정")
-        min_volume = st.number_input("최소 거래대금 (USDT)", 100_000.0, 50_000_000.0, 1_000_000.0, 100_000.0)
-        account_size = st.number_input("계좌 금액 (USDT)", 100.0, 10_000_000.0, 10_000.0, 100.0)
+    st.title("🔥 Crypto Quant Dashboard V12")
+    st.caption("단기 스윙 vs 장기 홀딩 전략 및 자금 회전 가이드 시스템")
 
     market, active_exchange = fetch_tickers_with_fallback()
     if market.empty:
-        st.error("모든 지원 거래소에서 시세를 불러오지 못했습니다.")
+        st.error("거래소 시세 데이터를 불러오지 못했습니다.")
         return
-    else:
-        st.caption(f"데이터 연동 성공 거래소: **{active_exchange.upper()}**")
 
-    # 🌐 4차원 매크로 매트릭스 분석 및 바이어스 획득
-    macro_bias = render_macro_dashboard(market)
-    st.divider()
+    # 4D 매크로 분석
+    macro_bias, macro_pattern = render_macro_dashboard(market)
 
-    universe = market[market["quote_volume"] >= min_volume].sort_values("quote_volume", ascending=False).head(20)
+    # 상위 종목 필터링
+    universe = market[market["quote_volume"] >= 2_000_000].sort_values("quote_volume", ascending=False).head(15)
     symbols = universe["symbol"].tolist()
 
-    if st.button("🚀 4D 매크로 연동 멀티모드 분석 실행", use_container_width=True):
+    if st.button("🔍 듀얼 호라이즌(단기/장기) 정밀 분석 시작", use_container_width=True):
         results = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(analyze_symbol, s, macro_bias, BacktestConfig(account_size=account_size)) for s in symbols]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            futures = [pool.submit(analyze_symbol_dual_horizon, s, macro_bias, macro_pattern) for s in symbols]
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v11_results"] = results
+        st.session_state["v12_results"] = results
 
-    results = st.session_state.get("v11_results", [])
+    results = st.session_state.get("v12_results", [])
     if results:
-        df_res = pd.DataFrame(results)
-        
-        tab1, tab2 = st.tabs(["🔥 [공격형] 대세 추종 알파 모드", "🛡️ [방어형] 안전지대 헌터 모드"])
+        df_res = pd.DataFrame(results).sort_values("score", ascending=False)
 
-        with tab1:
-            st.markdown("### 🔥 공격형 추종 포지션 (4D 매크로 정렬)")
-            agg_rows = df_res[df_res["mode_type"] == "AGGRESSIVE"]
+        st.markdown("### 📋 추천 코인 종합 분석 브리핑 (카드형 뷰)")
+        st.caption("💡 각 종목카드를 통해 **단기 관점(빠른 익절 후 순환)**과 **장기 관점(목표 TP까지 홀딩)**을 한눈에 비교할 수 있습니다.")
+
+        for _, row in df_res.iterrows():
+            badge_class = "badge-long" if row["short_dir"] == "LONG" else "badge-short"
             
-            if agg_rows.empty:
-                st.info("현재 매크로 조건 및 필터를 만족하는 공격형 종목이 없습니다.")
-            else:
-                agg_longs = agg_rows[agg_rows["direction"] == "LONG"]
-                agg_shorts = agg_rows[agg_rows["direction"] == "SHORT"]
-
-                st.markdown("#### 🟢 LONG (매수) 추천 리스트")
-                if agg_longs.empty:
-                    st.caption("조건을 만족하는 롱 종목이 없습니다.")
-                for _, row in agg_longs.iterrows():
-                    sig = row["signal"]
-                    st.markdown(
-                        f"🔥 **{row['symbol']}** | 🟢 **LONG** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
-                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
-                        f"점수: {row['score']:.1f} | R:R: 1:{sig['rr']:.2f}"
-                    )
-
-                st.markdown("---")
-                st.markdown("#### 🔴 SHORT (매도) 추천 리스트")
-                if agg_shorts.empty:
-                    st.caption("조건을 만족하는 숏 종목이 없습니다.")
-                for _, row in agg_shorts.iterrows():
-                    sig = row["signal"]
-                    st.markdown(
-                        f"🔥 **{row['symbol']}** | 🔴 **SHORT** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
-                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
-                        f"점수: {row['score']:.1f} | R:R: 1:{sig['rr']:.2f}"
-                    )
-
-        with tab2:
-            st.markdown("### 🛡️ 방어형 포지션")
-            def_rows = df_res[df_res["mode_type"] == "DEFENSIVE"]
-            
-            if def_rows.empty:
-                st.info("현재 방어적 국면에 부합하는 종목이 없습니다.")
-            else:
-                def_longs = def_rows[def_rows["direction"] == "LONG"]
-                def_shorts = def_rows[def_rows["direction"] == "SHORT"]
-
-                st.markdown("#### 🟢 LONG (매수) 추천 리스트")
-                if def_longs.empty:
-                    st.caption("조건을 만족하는 롱 종목이 없습니다.")
-                for _, row in def_longs.iterrows():
-                    sig = row["signal"]
-                    st.markdown(
-                        f"🛡️ **{row['symbol']}** | 🟢 **LONG** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
-                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
-                        f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
-                    )
-
-                st.markdown("---")
-                st.markdown("#### 🔴 SHORT (매도) 추천 리스트")
-                if def_shorts.empty:
-                    st.caption("조건을 만족하는 숏 종목이 없습니다.")
-                for _, row in def_shorts.iterrows():
-                    sig = row["signal"]
-                    st.markdown(
-                        f"🛡️ **{row['symbol']}** | 🛡️ **SHORT** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
-                        f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
-                        f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
-                    )
+            with st.container():
+                st.markdown(f"""
+                <div class="metric-card">
+                    <h4><b>{row['symbol']}</b> <span style="font-size:12px; color:#a0aec0;">({row['exchange']})</span> &nbsp; <span class="{badge_class}">{row['short_dir']}</span> &nbsp; <b>현재가:</b> {fmt_price(row['price'])} &nbsp; <b>퀀트점수:</b> {row['score']:.1f}점</h4>
+                    <hr style="margin: 5px 0 10px 0; border-color: #2d3748;">
+                    <b>⚡ [단기 관점 - 4시간봉 스윙]</b><br>
+                    &nbsp;&nbsp;• 목표가(TP): <code>{fmt_price(row['short_tp'])}</code> &nbsp;|&nbsp; 손절가(SL): <code>{fmt_price(row['short_sl'])}</code> &nbsp;|&nbsp; RSI: <code>{row['short_rsi']:.1f}</code><br><br>
+                    <b>📈 [장기 관점 - 1일봉 매크로 트렌드]</b><br>
+                    &nbsp;&nbsp;• 대세 목표가(TP): <code>{fmt_price(row['long_tp'])}</code> &nbsp;|&nbsp; 대세 손절가(SL): <code>{fmt_price(row['long_sl'])}</code><br><br>
+                    📌 <b>운영 가이드:</b> {row['holding_advice']}
+                </div>
+                """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
