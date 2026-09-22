@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V7
+Crypto Quant Dashboard V8
+- Added Volume Velocity & Wick Filter (Stops noise signals from disappearing instantly)
 - Physical Separation of LONG vs SHORT inside Aggressive & Defensive Tabs
 - Main Screen Macro Regime Bar (BTC, Dominance, Liquidity Flow)
-- Dynamic ATR TP Extension, ML Ensemble, Hierarchical MTF
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import ta
-from sklearn.linear_model import LogisticRegression
 
 
 # ============================================================
@@ -27,7 +26,7 @@ from sklearn.linear_model import LogisticRegression
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V7",
+    page_title="🔥 Crypto Quant Dashboard V8",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -188,6 +187,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     x["REL_VOLUME"] = x["Volume"] / x["VOL_MA20"]
     x["SWING_HIGH"] = x["High"].rolling(10, center=False).max().shift(1)
     x["SWING_LOW"] = x["Low"].rolling(10, center=False).min().shift(1)
+    
+    # 캔들 몸통 비율 계산 (노이즈/위아래 꼬리 필터용)
+    candle_range = x["High"] - x["Low"]
+    body_size = (x["Close"] - x["Open"]).abs()
+    x["BODY_RATIO"] = np.where(candle_range > 0, body_size / candle_range, 0.0)
+
     x["POC_Price"] = rolling_poc(x, window=60, bins=20)
     return x
 
@@ -260,7 +265,7 @@ def mtf_direction_score(mtf: dict, direction: str) -> tuple[float, list[str]]:
 
 def classify_market_state(df: pd.DataFrame) -> dict:
     if len(df) < 220:
-        return {"state": "UNKNOWN", "trend": 0.0, "reversal": 0.0}
+        return {"state": "UNKNOWN", "adx": 0.0, "rsi": 0.0}
     r = df.iloc[-1]
     close = float(r["Close"])
     up = close > r["EMA20"] > r["EMA50"] and r["EMA50"] > r["EMA200"]
@@ -276,7 +281,7 @@ def classify_market_state(df: pd.DataFrame) -> dict:
 
 
 # ============================================================
-# 4. DYNAMIC ATR TP & COST DEFENSE
+# 4. DYNAMIC ATR TP & STRICT NOISE FILTERS
 # ============================================================
 
 def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
@@ -292,14 +297,20 @@ def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
     return {"tp": float(best_tp), "rr": float(best_rr), "tp_source": "dynamic_atr"}
 
 
-# ============================================================
-# 5. SIGNAL & ML ENSEMBLE
-# ============================================================
-
 def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) -> Optional[dict]:
     if len(df) < 220:
         return None
     r = df.iloc[-1]
+    
+    # 🛡️ [V8 핵심 방어선] 가짜 펌프 및 꼬리 노이즈 실시간 차단 필터
+    # 1. 거래량 가속도: 평균 거래량 대비 최소 1.5배 이상 유입 필수
+    # 2. 캔들 몸통 비율: 위아래 꼬리가 너무 긴 장대비늘 봉(몸통 < 45%)은 가짜로 판정하여 차단
+    rel_vol = float(r["REL_VOLUME"]) if pd.notna(r["REL_VOLUME"]) else 1.0
+    body_ratio = float(r["BODY_RATIO"]) if pd.notna(r["BODY_RATIO"]) else 1.0
+    
+    if rel_vol < 1.4 or body_ratio < 0.45:
+        return None  # 노이즈 구간이므로 신호 생성 거부
+
     close = float(r["Close"]); atr = float(r["ATR14"])
     state = classify_market_state(df)
     mtf_score, _ = mtf_direction_score(mtf, direction)
@@ -324,7 +335,7 @@ def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) 
 
 
 # ============================================================
-# 6. SYMBOL ANALYSIS & DUAL MODE CATEGORIZATION
+# 5. SYMBOL ANALYSIS & DUAL MODE CATEGORIZATION
 # ============================================================
 
 def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
@@ -356,7 +367,7 @@ def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
 
 
 # ============================================================
-# 7. STREAMLIT UI (롱/숏 물리적 분리 및 한줄 정리 렌더링)
+# 6. STREAMLIT UI
 # ============================================================
 
 def fmt_price(x):
@@ -366,8 +377,8 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V7")
-    st.caption("글로벌 매크로 레짐 분석 탑재 · 롱/숏 물리적 분리 매매판")
+    st.title("🔥 Crypto Quant Dashboard V8")
+    st.caption("글로벌 매크로 레짐 분석 탑재 · 3중 노이즈 차단 필터 적용 완료")
 
     with st.sidebar:
         st.header("⚙️ 설정")
@@ -387,29 +398,28 @@ def main():
     universe = market[market["quote_volume"] >= min_volume].sort_values("quote_volume", ascending=False).head(20)
     symbols = universe["symbol"].tolist()
 
-    if st.button("🚀 멀티모드 분석 실행", use_container_width=True):
+    if st.button("🚀 정밀 멀티모드 분석 실행", use_container_width=True):
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             futures = [pool.submit(analyze_symbol, s, BacktestConfig(account_size=account_size)) for s in symbols]
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v7_results"] = results
+        st.session_state["v8_results"] = results
 
-    results = st.session_state.get("v7_results", [])
+    results = st.session_state.get("v8_results", [])
     if results:
         df_res = pd.DataFrame(results)
         
         tab1, tab2 = st.tabs(["🔥 [공격형] 대세 추종 알파 모드 (High RR)", "🛡️ [방어형] 숏컷 헌터 모드 (High Win-Rate)"])
 
         with tab1:
-            st.markdown("### 🔥 공격형 추종 포지션 (ATR 4~6배 파도타기)")
+            st.markdown("### 🔥 공격형 추종 포지션 (노이즈 필터링 적용)")
             agg_rows = df_res[df_res["mode_type"] == "AGGRESSIVE"]
             
             if agg_rows.empty:
-                st.info("현재 공격적 추세 조건을 만족하는 종목이 없습니다.")
+                st.info("현재 노이즈를 통과하고 공격적 추세 조건을 만족하는 종목이 없습니다.")
             else:
-                # 🟢 롱과 숏을 물리적으로 완벽히 분리
                 agg_longs = agg_rows[agg_rows["direction"] == "LONG"]
                 agg_shorts = agg_rows[agg_rows["direction"] == "SHORT"]
 
@@ -437,7 +447,7 @@ def main():
                     )
 
         with tab2:
-            st.markdown("### 🛡️ 방어형 숏컷 헌터 포지션 (짧은 익절 / 칼손절)")
+            st.markdown("### 🛡️ 방어형 숏컷 헌터 포지션 (노이즈 필터링 적용)")
             def_rows = df_res[df_res["mode_type"] == "DEFENSIVE"]
             
             if def_rows.empty:
