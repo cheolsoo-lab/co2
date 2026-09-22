@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V21 (Robust Data Fetching & Hybrid TP/SL)
-- Enhanced Exception Handling & Fallback for CCXT API
-- Expanded Universe: Top 50 Coins by Volume with Safe Parsing
-- Multi-Timeframe (1D + 4H) + Orderflow + RS
+Crypto Quant Dashboard V22 (Macro Comprehensive Analysis Restored)
+- Restored & Enhanced Macro Comprehensive Analysis Card
+- Robust Multi-Exchange Fallback (Binance, Bybit, OKX)
+- Top 50 Coin Universe & Hybrid TP/SL Engine
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V21",
+    page_title="🔥 Crypto Quant Dashboard V22",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -76,7 +76,6 @@ def make_exchange(exchange_id: str):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_tickers_safe() -> tuple[pd.DataFrame, str]:
-    """거래소별로 순차 접근하여 차단이나 타임아웃 시 대체 거래소로 자동 우회"""
     for exchange_id in DEFAULT_EXCHANGES:
         try:
             ex = make_exchange(exchange_id)
@@ -84,13 +83,11 @@ def fetch_tickers_safe() -> tuple[pd.DataFrame, str]:
             tickers = ex.fetch_tickers()
             rows = []
             for symbol, t in tickers.items():
-                # USDT 페어만 필터링
                 if not symbol.endswith("USDT") and not "/USDT" in symbol:
                     continue
                 
                 clean_symbol = symbol.split(":")[0] if ":" in symbol else symbol
                 if not clean_symbol.endswith("/USDT"):
-                    # 예: BTCUSDT 형태인 경우 변환
                     if clean_symbol.endswith("USDT") and "/" not in clean_symbol:
                         base = clean_symbol[:-4]
                         clean_symbol = f"{base}/USDT"
@@ -115,8 +112,7 @@ def fetch_tickers_safe() -> tuple[pd.DataFrame, str]:
             df = pd.DataFrame(rows).drop_duplicates("symbol")
             if not df.empty:
                 return df, exchange_id
-        except Exception as e:
-            print(f"[{exchange_id}] fetch_tickers error: {e}")
+        except Exception:
             continue
             
     return pd.DataFrame(), ""
@@ -126,7 +122,6 @@ def fetch_tickers_safe() -> tuple[pd.DataFrame, str]:
 def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
     try:
         ex = make_exchange(exchange_id)
-        # 바이낸스 등 선물 심볼 포맷 맞춤
         raw_symbol = symbol if exchange_id != "binance" else f"{symbol.replace('/','')} :USDT" if ":" not in symbol else symbol
         if exchange_id == "binance" and ":" not in raw_symbol:
             raw_symbol = f"{symbol.split('/')[0]}/USDT:USDT"
@@ -172,29 +167,51 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         return None
 
 
-def render_market_horizon_dashboard(market_df: pd.DataFrame):
+# ============================================================
+# 2. MACRO COMPREHENSIVE ANALYSIS ENGINE
+# ============================================================
+
+def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
     btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
-    avg_change = market_df["change_pct"].mean()
+    avg_change = float(market_df["change_pct"].mean())
 
     if btc_change > 1.5 and avg_change > 0.5:
         phase = "🚀 강한 상승장 (Risk-On)"
+        action_guide = "공격형/안정형 롱(LONG) 포지션 중심의 주도주 집중 매매 권장"
     elif btc_change < -1.5 or avg_change < -0.8:
         phase = "🩸 하락 추세 (Risk-Off)"
+        action_guide = "공격형 및 안정형 숏(SHORT) 베팅 및 현금 비중 확대 대응"
     else:
-        phase = "⚖️ 혼조세 및 횡보장"
+        phase = "⚖️ 혼조세 및 박스권 횡보장"
+        action_guide = "무리한 추격 매수 자제, 1D/4H 눌림목 중심의 엄선된 종목 선별 대응"
 
+    return {
+        "phase": phase,
+        "action_guide": action_guide,
+        "btc_change": btc_change,
+        "avg_change": avg_change
+    }
+
+
+def render_market_horizon_dashboard(market_df: pd.DataFrame):
+    m = analyze_market_wide_horizon(market_df)
     st.markdown(f"""
     <div class="macro-card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-            <h3 style="margin: 0; color: #1e293b;">🌐 Top 50 코인 멀티 타임프레임 & 하이브리드 퀀트 진단</h3>
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+            <h3 style="margin: 0; color: #1e293b;">🌐 거시적 종합분석 & 마켓 센티먼트 진단</h3>
             <span style="background: #e0f2fe; color: #0369a1; padding: 6px 14px; border-radius: 20px; font-weight: 700; font-size: 14px;">
-                {phase}
+                {m['phase']}
             </span>
         </div>
-        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px;">
-            <div class="stat-pill">₿ BTC 24H: <b>{btc_change:+.2f}%</b></div>
-            <div class="stat-pill">🔍 스캔 유니버스: <b>상위 50개 알트·메이저 종목 (연결 거래소 자동 최적화)</b></div>
+        <p style="font-size: 15px; font-weight: 600; color: #0f172a; margin-bottom: 15px;">
+            💡 실전 대응 가이드: <span style="color: #2563eb;">{m['action_guide']}</span>
+        </p>
+        <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 12px 0;">
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
+            <div class="stat-pill">₿ BTC 24H 변동률: <b>{m['btc_change']:+.2f}%</b></div>
+            <div class="stat-pill">📊 시장 평균 변동률: <b>{m['avg_change']:+.2f}%</b></div>
+            <div class="stat-pill">⚡ 엔진 구성: <b>1D추세 + 4H타점 + RS + 하이브리드 TP/SL</b></div>
         </div>
     </div>
     """, unsafe_allow_html=True)
@@ -202,10 +219,10 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
 
 
 # ============================================================
-# 2. HYBRID TP/SL & QUANT ANALYSIS ENGINE (V21)
+# 3. QUANT ANALYSIS & UI
 # ============================================================
 
-def analyze_symbol_v21(symbol: str, exchange_id: str, market_avg_change: float) -> Optional[dict]:
+def analyze_symbol_v22(symbol: str, exchange_id: str, market_avg_change: float) -> Optional[dict]:
     data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
     if not data:
         return None
@@ -231,7 +248,6 @@ def analyze_symbol_v21(symbol: str, exchange_id: str, market_avg_change: float) 
 
     group, pos_type = None, None
 
-    # 조건 판별 로직
     if r_1d["Close"] > r_1d["EMA20"] and rel_vol >= 1.3 and relative_strength > 0.5 and rsi_4h < 75:
         group, pos_type = "AGGRESSIVE", "LONG"
     elif r_1d["Close"] < r_1d["EMA20"] and rel_vol >= 1.3 and relative_strength < -0.5 and rsi_4h > 25:
@@ -243,7 +259,7 @@ def analyze_symbol_v21(symbol: str, exchange_id: str, market_avg_change: float) 
     else:
         return None
 
-    # 🎯 하이브리드 TP/SL 산출 (안전 캡 적용)
+    # 하이브리드 TP/SL 산출 (안전 캡 적용)
     if pos_type == "LONG":
         raw_tp = close + (2.2 * atr)
         cap_tp = close * 1.05
@@ -271,10 +287,6 @@ def analyze_symbol_v21(symbol: str, exchange_id: str, market_avg_change: float) 
     }
 
 
-# ============================================================
-# 3. STREAMLIT UI
-# ============================================================
-
 def fmt_price(x):
     if x >= 1000: return f"${x:,.2f}"
     if x >= 1: return f"${x:,.4f}"
@@ -282,17 +294,19 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V21")
-    st.caption("네트워크 자동 우회 및 Top 50 코인 안정화 스캐너")
+    st.title("🔥 Crypto Quant Dashboard V22")
+    st.caption("거시적 종합분석 및 Top 50 코인 하이브리드 퀀트 스캐너")
 
-    with st.spinner("거래소 시세 데이터를 안전하게 불러오는 중입니다..."):
+    with st.spinner("시세 데이터를 안전하게 불러오는 중입니다..."):
         market, active_exchange = fetch_tickers_safe()
 
     if market.empty:
-        st.error("⚠️ 모든 거래소(Binance, Bybit, OKX) 연결이 지연되었거나 차단되었습니다. 잠시 후 다시 시도해 주세요.")
+        st.error("⚠️ 거래소 데이터 연결에 실패했습니다. 잠시 후 다시 시도해 주세요.")
         return
 
     st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 데이터 연동 완료 (총 {len(market)}개 심볼 감지)")
+    
+    # 🌐 거시적 종합분석 카드 렌더링
     render_market_horizon_dashboard(market)
 
     universe = market.sort_values("quote_volume", ascending=False).head(50)
@@ -305,7 +319,7 @@ def main():
         total_symbols = len(symbols)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(analyze_symbol_v21, s, active_exchange, market_avg_change): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v22, s, active_exchange, market_avg_change): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -315,9 +329,9 @@ def main():
                     results.append(r)
         
         progress_bar.empty()
-        st.session_state["v21_results"] = results
+        st.session_state["v22_results"] = results
 
-    results = st.session_state.get("v21_results", [])
+    results = st.session_state.get("v22_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
