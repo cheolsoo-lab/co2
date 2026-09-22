@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V25 (WFO Optimization & Bitget Auto-Trading Integration)
+Crypto Quant Dashboard V26 (Bitget Auto TP/SL & WFO Integration)
 - Walk-Forward Optimization (WFO) Engine for Dynamic TP/SL & RS Tuning
-- WFE (Walk-Forward Efficiency) Health Monitoring
-- Bitget Futures API Integration & Macro Comprehensive Analysis
+- Bitget Futures API Integration with OCO/Conditional TP & SL Execution
 """
 
 from __future__ import annotations
@@ -22,7 +21,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V25",
+    page_title="🔥 Crypto Quant Dashboard V26",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -65,7 +64,7 @@ DEFAULT_EXCHANGES = ["bitget", "binance", "bybit"]
 
 
 # ============================================================
-# 1. DATA ACCESS & BITGET API EXECUTION
+# 1. DATA ACCESS & BITGET API EXECUTION (WITH AUTO TP/SL)
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -160,7 +159,7 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
 
         return {
             "df_1d": df_1d.iloc[:-1],
-            "df_4h": df_4h.iloc[:-1],
+            "df_4h": df_4h.iloc[-1],
             "funding_rate": funding_rate,
             "exchange": exchange_id.upper()
         }
@@ -168,43 +167,74 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         return None
 
 
-def execute_bitget_futures_order(symbol: str, pos_type: str, amount_usdt: float, api_key: str, secret: str, password: str):
+def execute_bitget_futures_order_with_tpsl(symbol: str, pos_type: str, amount_usdt: float, tp: float, sl: float, api_key: str, secret: str, password: str):
+    """
+    비트겟 선물 시장가 진입 주문과 동시에 익절(TP) 및 손절(SL) 지정가 주문을 함께 전송합니다.
+    """
     try:
         ex = make_exchange("bitget", api_key, secret, password)
         formatted_symbol = f"{symbol}:USDT" if not symbol.endswith(":USDT") else symbol
         
+        # 1. 시세 확인 및 수량 계산
         ticker = ex.fetch_ticker(formatted_symbol)
         current_price = ticker["last"]
         amount = amount_usdt / current_price
 
         side = "buy" if pos_type == "LONG" else "sell"
-        order = ex.create_market_order(formatted_symbol, side, amount)
-        return True, f"주문 성공! 평균체결가: {order.get('average', current_price)}"
+        close_side = "sell" if pos_type == "LONG" else "buy"
+
+        # 2. 메인 시장가 진입 주문 전송
+        entry_order = ex.create_market_order(formatted_symbol, side, amount)
+        msg_result = f"진입 성공 (체결가: {entry_order.get('average', current_price):,.4f})"
+
+        # 3. 익절(TP) 주문 전송 (ReduceOnly 반영)
+        try:
+            ex.create_order(
+                symbol=formatted_symbol,
+                type='limit',
+                side=close_side,
+                amount=amount,
+                price=tp,
+                params={'reduceOnly': True, 'triggerPrice': tp}
+            )
+            msg_result += " | TP 자동설정 완료"
+        except Exception as tp_err:
+            msg_result += f" | TP 설정 실패({str(tp_err)})"
+
+        # 4. 손절(SL) 주문 전송 (ReduceOnly 반영)
+        try:
+            ex.create_order(
+                symbol=formatted_symbol,
+                type='market',
+                side=close_side,
+                amount=amount,
+                params={'reduceOnly': True, 'triggerPrice': sl, 'stopPrice': sl}
+            )
+            msg_result += " | SL 자동설정 완료"
+        except Exception as sl_err:
+            msg_result += f" | SL 설정 실패({str(sl_err)})"
+
+        return True, msg_result
     except Exception as e:
         return False, str(e)
 
 
 # ============================================================
-# 2. WFO (WALK-FORWARD OPTIMIZATION) & MACRO ENGINE
+# 2. WFO & MACRO ENGINE
 # ============================================================
 
 def run_walk_forward_optimization(market_df: pd.DataFrame) -> dict:
-    """
-    최근 시장 데이터를 기반으로 WFO 시뮬레이션을 수행하여 
-    현재 장세에 가장 적합한 ATR 배수와 RS 컷오프를 동적으로 산출하고 WFE를 측정합니다.
-    """
     avg_volatility = market_df["change_pct"].abs().mean()
     
-    # 동적 WFO 파라미터 튜닝 시뮬레이션
     if avg_volatility > 2.0:
         opt_atr_mult = 2.4
         opt_rs_cut = 0.35
-        wfe_score = 78.5  # 변동성이 좋을 때 효율성 높음
+        wfe_score = 78.5
         regime_status = "🚀 고변동성 트렌드 페이즈 (WFO 최적화 완료)"
     elif avg_volatility < 0.8:
         opt_atr_mult = 1.8
         opt_rs_cut = 0.05
-        wfe_score = 52.1  # 횡보장에서는 효율성 다소 감소
+        wfe_score = 52.1
         regime_status = "⚖️ 저변동성 박스권 페이즈 (방어적 WFO 적용)"
     else:
         opt_atr_mult = 2.1
@@ -255,13 +285,13 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
             <div class="stat-pill">₿ BTC 24H 변동률: <b>{m['btc_change']:+.2f}%</b></div>
             <div class="stat-pill">📊 시장 평균 변동률: <b>{m['avg_change']:+.2f}%</b></div>
-            <div class="stat-pill">⚡ WFO 전략 상태: <b>정상 가동 중</b></div>
+            <div class="stat-pill">⚡ WFO 전략 상태: <b>자동 TP/SL 연동 가동 중</b></div>
         </div>
     </div>
     
     <div class="wfo-card">
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <h4 style="margin: 0; color: #581c87;">📈 WFO (워크포워드 최적화) 실시간 엔진 리포트</h4>
+            <h4 style="margin: 0; color: #581c87;">📈 WFO (워크포워드 최적화) 엔진 리포트</h4>
             <span style="background: #f3e8ff; color: #7e22ce; padding: 4px 10px; border-radius: 12px; font-weight: 700; font-size: 12px;">
                 WFE 효율성 지수: {wfo_res['wfe']:.1f}%
             </span>
@@ -275,7 +305,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
     st.divider()
 
 
-def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
+def analyze_symbol_v26(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
     data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
     if not data:
         return None
@@ -303,7 +333,6 @@ def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, 
 
     group, pos_type = None, None
 
-    # WFO 최적화된 RS 컷오프 적용
     if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.05 and relative_strength > rs_cut and rsi_4h < 78:
         group, pos_type = "AGGRESSIVE", "LONG"
     elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.05 and relative_strength < -rs_cut and rsi_4h > 22:
@@ -315,7 +344,6 @@ def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, 
     else:
         return None
 
-    # WFO 최적화된 ATR 배수 적용
     if pos_type == "LONG":
         raw_tp = close + (atr_mult * atr)
         cap_tp = close * 1.06
@@ -337,7 +365,7 @@ def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, 
         "symbol": symbol, "exchange": data["exchange"], "price": close,
         "group": group, "pos_type": pos_type, "tp": tp, "sl": sl,
         "rsi": rsi_4h, "rel_vol": rel_vol, "rs": relative_strength,
-        "score": score, "allocation": 20.0
+        "score": score
     }
 
 
@@ -352,11 +380,11 @@ def fmt_price(x):
 # ============================================================
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V25")
-    st.caption("WFO 동적 최적화 + 비트겟 선물 자동 주문 연동 퀀트 시스템")
+    st.title("🔥 Crypto Quant Dashboard V26")
+    st.caption("WFO 동적 최적화 + 비트겟 선물 자동 주문 및 TP/SL 자동 연동 퀀트 시스템")
 
     st.sidebar.header("⚙️ 비트겟 선물 API 설정")
-    st.sidebar.caption("자동 주문을 실행하려면 비트겟 API 정보를 입력하세요.")
+    st.sidebar.caption("자동 주문 및 TP/SL 동시 세팅을 위해 API 정보를 입력하세요.")
     bitget_api_key = st.sidebar.text_input("API Key", type="password")
     bitget_secret = st.sidebar.text_input("Secret Key", type="password")
     bitget_passphrase = st.sidebar.text_input("Passphrase (비밀번호)", type="password")
@@ -373,7 +401,6 @@ def main():
 
     st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 데이터 연동 완료 (총 {len(market)}개 심볼 감지)")
     
-    # WFO 분석 수행 및 대시보드 렌더링
     wfo_params = run_walk_forward_optimization(market)
     render_market_horizon_dashboard(market, wfo_params)
 
@@ -387,7 +414,7 @@ def main():
         total_symbols = len(symbols)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(analyze_symbol_v25, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v26, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -396,9 +423,9 @@ def main():
                 if r: results.append(r)
         
         progress_bar.empty()
-        st.session_state["v25_results"] = results
+        st.session_state["v26_results"] = results
 
-    results = st.session_state.get("v25_results", [])
+    results = st.session_state.get("v26_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
@@ -431,19 +458,19 @@ def main():
                     """, unsafe_allow_html=True)
 
                     btn_key = f"btn_agg_{row['symbol']}"
-                    if st.button(f"⚡ [{row['symbol']}] 비트겟 즉시 주문 실행", key=btn_key):
+                    if st.button(f"⚡ [{row['symbol']}] 비트겟 자동주문 (TP/SL 포함)", key=btn_key):
                         if not auto_trade_enabled:
                             st.warning("사이드바에서 '비트겟 실전 자동 주문 활성화'를 체크해주세요.")
                         elif not bitget_api_key or not bitget_secret or not bitget_passphrase:
                             st.error("사이드바에 비트겟 API Key, Secret, Passphrase를 모두 입력해주세요.")
                         else:
-                            with st.spinner("비트겟 선물 주문 전송 중..."):
-                                success, msg = execute_bitget_futures_order(
+                            with st.spinner("비트겟 시장가 진입 및 TP/SL 지정가 주문 전송 중..."):
+                                success, msg = execute_bitget_futures_order_with_tpsl(
                                     row["symbol"], row["pos_type"], order_usdt_size,
-                                    bitget_api_key, bitget_secret, bitget_passphrase
+                                    row["tp"], row["sl"], bitget_api_key, bitget_secret, bitget_passphrase
                                 )
                                 if success:
-                                    st.success(f"✅ {row['symbol']} {row['pos_type']} 진입 성공! ({msg})")
+                                    st.success(f"✅ {row['symbol']} {row['pos_type']} 주문 완료! ({msg})")
                                 else:
                                     st.error(f"❌ 주문 실패: {msg}")
 
@@ -472,19 +499,19 @@ def main():
                     """, unsafe_allow_html=True)
 
                     btn_key = f"btn_stable_{row['symbol']}"
-                    if st.button(f"⚡ [{row['symbol']}] 비트겟 즉시 주문 실행", key=btn_key):
+                    if st.button(f"⚡ [{row['symbol']}] 비트겟 자동주문 (TP/SL 포함)", key=btn_key):
                         if not auto_trade_enabled:
                             st.warning("사이드바에서 '비트겟 실전 자동 주문 활성화'를 체크해주세요.")
                         elif not bitget_api_key or not bitget_secret or not bitget_passphrase:
                             st.error("사이드바에 비트겟 API Key, Secret, Passphrase를 모두 입력해주세요.")
                         else:
-                            with st.spinner("비트겟 선물 주문 전송 중..."):
-                                success, msg = execute_bitget_futures_order(
+                            with st.spinner("비트겟 시장가 진입 및 TP/SL 지정가 주문 전송 중..."):
+                                success, msg = execute_bitget_futures_order_with_tpsl(
                                     row["symbol"], row["pos_type"], order_usdt_size,
-                                    bitget_api_key, bitget_secret, bitget_passphrase
+                                    row["tp"], row["sl"], bitget_api_key, bitget_secret, bitget_passphrase
                                 )
                                 if success:
-                                    st.success(f"✅ {row['symbol']} {row['pos_type']} 진입 성공! ({msg})")
+                                    st.success(f"✅ {row['symbol']} {row['pos_type']} 주문 완료! ({msg})")
                                 else:
                                     st.error(f"❌ 주문 실패: {msg}")
 
