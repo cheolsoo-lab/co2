@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V15
+Crypto Quant Dashboard V15 (Fixed)
 - Clean Light UI Design
 - Pullback & Momentum Hybrid Filtering (Aggressive vs Stable)
 - Swing High/Low Dynamic TP/SL Engine
@@ -10,7 +10,6 @@ Crypto Quant Dashboard V15
 from __future__ import annotations
 
 import concurrent.futures
-from dataclasses import dataclass
 from typing import Optional
 
 import ccxt
@@ -114,7 +113,6 @@ def fetch_ohlcv(exchange_id: str, symbol: str, timeframe: str = "1d", limit: int
     if len(df) > 2:
         df = df.iloc[:-1].copy()
     
-    # 지표 및 매물대(Swing High/Low) 계산
     df["EMA20"] = ta.trend.EMAIndicator(df["Close"], window=20).ema_indicator()
     df["EMA50"] = ta.trend.EMAIndicator(df["Close"], window=50).ema_indicator()
     df["RSI14"] = ta.momentum.RSIIndicator(df["Close"], window=14).rsi()
@@ -143,8 +141,7 @@ def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
     
     total_vol = market_df["quote_volume"].sum()
     btc_vol = market_df[market_df["base"] == "BTC"]["quote_volume"].sum()
-    eth_vol = market_df[market_df["base"] == "ETH"]["quote_volume"].sum()
-    alt_vol = total_vol - (btc_vol + eth_vol)
+    alt_vol = total_vol - btc_vol
     
     btc_dom = (btc_vol / total_vol) * 100 if total_vol > 0 else 50.0
     alt_share = (alt_vol / total_vol) * 100 if total_vol > 0 else 50.0
@@ -194,7 +191,7 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame):
 
 
 # ============================================================
-# 2. ADVANCED SYMBOL ANALYSIS (Aggressive vs Stable + Swing TP/SL)
+# 2. ADVANCED SYMBOL ANALYSIS
 # ============================================================
 
 def analyze_symbol_v15(symbol: str) -> Optional[dict]:
@@ -213,27 +210,18 @@ def analyze_symbol_v15(symbol: str) -> Optional[dict]:
         swing_high = float(r["SWING_HIGH"]) if pd.notna(r["SWING_HIGH"]) else close + (3.0 * atr)
         swing_low = float(r["SWING_LOW"]) if pd.notna(r["SWING_LOW"]) else close - (1.5 * atr)
 
-        # 동적 매물대 기반 TP/SL 산출 (저항선 활용)
         tp = min(swing_high, close + (3.5 * atr))
         sl = max(swing_low, close - (1.2 * atr))
 
-        # 성향 분류 (공격형 모멘텀 vs 안정형 눌림목)
-        # 공격형: 거래량이 평소보다 2배 이상 터지고 양봉 확장 중인 돌파 종목
         if rel_vol >= 1.8 and change_24h > 2.0 and rsi < 75:
             strategy_type = "AGGRESSIVE"
             score = float(np.clip(rel_vol * 25 + change_24h * 5, 50, 100))
-        # 안정형: 이평선(EMA20) 근처에서 지지를 받으며 RSI가 과열되지 않은 눌림목 종목
         elif close >= float(r["EMA20"]) and 40 <= rsi <= 62:
             strategy_type = "STABLE"
             score = float(np.clip((62 - abs(rsi - 50)) * 1.5 + rel_vol * 15, 40, 95))
         else:
-            strategy_type = "NEUTRAL"
-            score = 30.0
-
-        if strategy_type == "NEUTRAL":
             return None
 
-        # 포지션 비중 제안 (SL 거리 기반 역산 - 총 자산의 1% 리스크 기준)
         risk_per_share = abs(close - sl)
         recommended_allocation_pct = min(max(5.0, 15.0 / (risk_per_share / close * 100)), 25.0)
 
@@ -347,7 +335,7 @@ def main():
                             📊 <b>RSI:</b> {row['rsi']:.1f} &nbsp;|&nbsp; <b>상대볼륨:</b> {row['rel_vol']:.1f}배 &nbsp;|&nbsp; <b>권장비중:</b> <b>{row['allocation']:.0f}%</b>
                         </div>
                     </div>
-                    """, unsafe_allow_html=`True`)
+                    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
