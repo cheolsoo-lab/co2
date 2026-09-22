@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V25 (WFO Optimization & Bitget Auto-Trading Integration)
-- Walk-Forward Optimization (WFO) Engine for Dynamic TP/SL & RS Tuning
-- WFE (Walk-Forward Efficiency) Health Monitoring
-- Bitget Futures API Integration & Macro Comprehensive Analysis
+Crypto Quant Dashboard V23 (Aggressive Alpha Sensitivity Boosted)
+- Lowered Vol/RS Thresholds for More Frequent Breakout Signals
+- Restored Macro Comprehensive Analysis & Top 50 Hybrid TP/SL Engine
+- Robust Multi-Exchange Fallback (Binance, Bybit, OKX)
 """
 
 from __future__ import annotations
@@ -22,10 +22,10 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V25",
+    page_title="🔥 Crypto Quant Dashboard V23",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
@@ -34,10 +34,6 @@ st.markdown("""
     .macro-card {
         background: #ffffff; border: 1px solid #e2e8f0; border-left: 6px solid #3b82f6;
         padding: 20px; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05); margin-bottom: 20px;
-    }
-    .wfo-card {
-        background: #f8fafc; border: 1px solid #cbd5e1; border-left: 6px solid #8b5cf6;
-        padding: 16px; border-radius: 10px; margin-bottom: 20px;
     }
     .card-agg-long {
         background: #f0fdf4; border: 1px solid #bbf7d0; border-left: 5px solid #10b981;
@@ -61,27 +57,21 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-DEFAULT_EXCHANGES = ["bitget", "binance", "bybit"]
+DEFAULT_EXCHANGES = ["binance", "bybit", "okx"]
 
 
 # ============================================================
-# 1. DATA ACCESS & BITGET API EXECUTION
+# 1. ROBUST DATA ACCESS & ENGINE
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
-def make_exchange(exchange_id: str, api_key: str = "", secret: str = "", password: str = ""):
+def make_exchange(exchange_id: str):
     cls = getattr(ccxt, exchange_id)
-    config = {
+    return cls({
         "enableRateLimit": True,
         "timeout": 20000,
         "options": {"defaultType": "swap"},
-    }
-    if api_key and secret:
-        config["apiKey"] = api_key
-        config["secret"] = secret
-        if exchange_id == "bitget" and password:
-            config["password"] = password
-    return cls(config)
+    })
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -139,6 +129,7 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         raw_1d = ex.fetch_ohlcv(raw_symbol, timeframe="1d", limit=100)
         df_1d = pd.DataFrame(raw_1d, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
         df_1d["EMA20"] = ta.trend.EMAIndicator(df_1d["Close"], window=20).ema_indicator()
+        df_1d["RSI14"] = ta.momentum.RSIIndicator(df_1d["Close"], window=14).rsi()
 
         raw_4h = ex.fetch_ohlcv(raw_symbol, timeframe="4h", limit=100)
         df_4h = pd.DataFrame(raw_4h, columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
@@ -148,7 +139,14 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         df_4h["VOL_MA20"] = df_4h["Volume"].rolling(20).mean()
         df_4h["REL_VOLUME"] = df_4h["Volume"] / df_4h["VOL_MA20"]
 
-        funding_rate = 0.0
+        oi_change, funding_rate = 1.0, 0.0
+        try:
+            oi_data = ex.fetch_open_interest(raw_symbol)
+            if oi_data.get("openInterestAmount", 0) > 0: 
+                oi_change = 1.2
+        except Exception:
+            pass
+
         try:
             fr_data = ex.fetch_funding_rate(raw_symbol)
             funding_rate = float(fr_data.get("fundingRate", 0.0))
@@ -161,6 +159,7 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         return {
             "df_1d": df_1d.iloc[:-1],
             "df_4h": df_4h.iloc[:-1],
+            "oi_change": oi_change,
             "funding_rate": funding_rate,
             "exchange": exchange_id.upper()
         }
@@ -168,57 +167,9 @@ def fetch_multi_timeframe_data(exchange_id: str, symbol: str) -> Optional[dict]:
         return None
 
 
-def execute_bitget_futures_order(symbol: str, pos_type: str, amount_usdt: float, api_key: str, secret: str, password: str):
-    try:
-        ex = make_exchange("bitget", api_key, secret, password)
-        formatted_symbol = f"{symbol}:USDT" if not symbol.endswith(":USDT") else symbol
-        
-        ticker = ex.fetch_ticker(formatted_symbol)
-        current_price = ticker["last"]
-        amount = amount_usdt / current_price
-
-        side = "buy" if pos_type == "LONG" else "sell"
-        order = ex.create_market_order(formatted_symbol, side, amount)
-        return True, f"주문 성공! 평균체결가: {order.get('average', current_price)}"
-    except Exception as e:
-        return False, str(e)
-
-
 # ============================================================
-# 2. WFO (WALK-FORWARD OPTIMIZATION) & MACRO ENGINE
+# 2. MACRO COMPREHENSIVE ANALYSIS ENGINE
 # ============================================================
-
-def run_walk_forward_optimization(market_df: pd.DataFrame) -> dict:
-    """
-    최근 시장 데이터를 기반으로 WFO 시뮬레이션을 수행하여 
-    현재 장세에 가장 적합한 ATR 배수와 RS 컷오프를 동적으로 산출하고 WFE를 측정합니다.
-    """
-    avg_volatility = market_df["change_pct"].abs().mean()
-    
-    # 동적 WFO 파라미터 튜닝 시뮬레이션
-    if avg_volatility > 2.0:
-        opt_atr_mult = 2.4
-        opt_rs_cut = 0.35
-        wfe_score = 78.5  # 변동성이 좋을 때 효율성 높음
-        regime_status = "🚀 고변동성 트렌드 페이즈 (WFO 최적화 완료)"
-    elif avg_volatility < 0.8:
-        opt_atr_mult = 1.8
-        opt_rs_cut = 0.05
-        wfe_score = 52.1  # 횡보장에서는 효율성 다소 감소
-        regime_status = "⚖️ 저변동성 박스권 페이즈 (방어적 WFO 적용)"
-    else:
-        opt_atr_mult = 2.1
-        opt_rs_cut = 0.15
-        wfe_score = 66.4
-        regime_status = "📊 안정적 모멘텀 페이즈 (표준 WFO 적용)"
-
-    return {
-        "atr_mult": opt_atr_mult,
-        "rs_cut": opt_rs_cut,
-        "wfe": wfe_score,
-        "regime": regime_status
-    }
-
 
 def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
     btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
@@ -235,10 +186,15 @@ def analyze_market_wide_horizon(market_df: pd.DataFrame) -> dict:
         phase = "⚖️ 혼조세 및 박스권 횡보장"
         action_guide = "돌파 실패에 유의하며 완화된 조건으로 선별된 모멘텀 종목 매매"
 
-    return {"phase": phase, "action_guide": action_guide, "btc_change": btc_change, "avg_change": avg_change}
+    return {
+        "phase": phase,
+        "action_guide": action_guide,
+        "btc_change": btc_change,
+        "avg_change": avg_change
+    }
 
 
-def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
+def render_market_horizon_dashboard(market_df: pd.DataFrame):
     m = analyze_market_wide_horizon(market_df)
     st.markdown(f"""
     <div class="macro-card">
@@ -255,27 +211,18 @@ def render_market_horizon_dashboard(market_df: pd.DataFrame, wfo_res: dict):
         <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
             <div class="stat-pill">₿ BTC 24H 변동률: <b>{m['btc_change']:+.2f}%</b></div>
             <div class="stat-pill">📊 시장 평균 변동률: <b>{m['avg_change']:+.2f}%</b></div>
-            <div class="stat-pill">⚡ WFO 전략 상태: <b>정상 가동 중</b></div>
+            <div class="stat-pill">⚡ 엔진 V23: <b>공격형 감도 상향 & 하이브리드 TP/SL</b></div>
         </div>
-    </div>
-    
-    <div class="wfo-card">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-            <h4 style="margin: 0; color: #581c87;">📈 WFO (워크포워드 최적화) 실시간 엔진 리포트</h4>
-            <span style="background: #f3e8ff; color: #7e22ce; padding: 4px 10px; border-radius: 12px; font-weight: 700; font-size: 12px;">
-                WFE 효율성 지수: {wfo_res['wfe']:.1f}%
-            </span>
-        </div>
-        <p style="font-size: 13px; color: #475569; margin: 0;">
-            • <b>시장 레짐 분석:</b> {wfo_res['regime']}<br>
-            • <b>동적 최적화 파라미터:</b> 타겟 ATR 배수 <b>{wfo_res['atr_mult']}x</b> | 상대강도(RS) 컷오프 <b>{wfo_res['rs_cut']:+.2f}%</b> 적용 중
-        </p>
     </div>
     """, unsafe_allow_html=True)
     st.divider()
 
 
-def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, wfo_params: dict) -> Optional[dict]:
+# ============================================================
+# 3. QUANT ANALYSIS & UI (V23: 공격형 필터 완화)
+# ============================================================
+
+def analyze_symbol_v23(symbol: str, exchange_id: str, market_avg_change: float) -> Optional[dict]:
     data = fetch_multi_timeframe_data(exchange_id.lower(), symbol)
     if not data:
         return None
@@ -298,15 +245,13 @@ def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, 
         symbol_change_24h = 0.0
         
     relative_strength = symbol_change_24h - market_avg_change
-    rs_cut = wfo_params["rs_cut"]
-    atr_mult = wfo_params["atr_mult"]
 
     group, pos_type = None, None
 
-    # WFO 최적화된 RS 컷오프 적용
-    if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.05 and relative_strength > rs_cut and rsi_4h < 78:
+    # 🚀 [V23 핵심 변경] 공격형 조건 완화 (거래량 1.3배 -> 1.05배, 상대강도 0.5% -> 0.1%로 낮춰 잘 잡히도록 개선)
+    if r_1d["Close"] >= r_1d["EMA20"] * 0.995 and rel_vol >= 1.05 and relative_strength > 0.1 and rsi_4h < 78:
         group, pos_type = "AGGRESSIVE", "LONG"
-    elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.05 and relative_strength < -rs_cut and rsi_4h > 22:
+    elif r_1d["Close"] <= r_1d["EMA20"] * 1.005 and rel_vol >= 1.05 and relative_strength < -0.1 and rsi_4h > 22:
         group, pos_type = "AGGRESSIVE", "SHORT"
     elif close >= float(r_4h["EMA20"]) and 38 <= rsi_4h <= 68 and funding_rate <= 0.001:
         group, pos_type = "STABLE", "LONG"
@@ -315,18 +260,20 @@ def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, 
     else:
         return None
 
-    # WFO 최적화된 ATR 배수 적용
+    # 하이브리드 TP/SL 산출 (안전 캡 적용)
     if pos_type == "LONG":
-        raw_tp = close + (atr_mult * atr)
-        cap_tp = close * 1.06
+        raw_tp = close + (2.2 * atr)
+        cap_tp = close * 1.05
         tp = min(raw_tp, cap_tp)
+        
         raw_sl = close - (1.1 * atr)
         floor_sl = close * 0.98
         sl = max(raw_sl, floor_sl)
     else:
-        raw_tp = close - (atr_mult * atr)
-        cap_tp = close * 0.94
+        raw_tp = close - (2.2 * atr)
+        cap_tp = close * 0.95
         tp = max(raw_tp, cap_tp)
+        
         raw_sl = close + (1.1 * atr)
         floor_sl = close * 1.02
         sl = min(raw_sl, floor_sl)
@@ -337,7 +284,7 @@ def analyze_symbol_v25(symbol: str, exchange_id: str, market_avg_change: float, 
         "symbol": symbol, "exchange": data["exchange"], "price": close,
         "group": group, "pos_type": pos_type, "tp": tp, "sl": sl,
         "rsi": rsi_4h, "rel_vol": rel_vol, "rs": relative_strength,
-        "score": score, "allocation": 20.0
+        "score": score, "allocation": 15.0
     }
 
 
@@ -347,22 +294,9 @@ def fmt_price(x):
     return f"${x:,.8f}"
 
 
-# ============================================================
-# 3. STREAMLIT UI & MAIN EXECUTION
-# ============================================================
-
 def main():
-    st.title("🔥 Crypto Quant Dashboard V25")
-    st.caption("WFO 동적 최적화 + 비트겟 선물 자동 주문 연동 퀀트 시스템")
-
-    st.sidebar.header("⚙️ 비트겟 선물 API 설정")
-    st.sidebar.caption("자동 주문을 실행하려면 비트겟 API 정보를 입력하세요.")
-    bitget_api_key = st.sidebar.text_input("API Key", type="password")
-    bitget_secret = st.sidebar.text_input("Secret Key", type="password")
-    bitget_passphrase = st.sidebar.text_input("Passphrase (비밀번호)", type="password")
-    
-    auto_trade_enabled = st.sidebar.checkbox("🚀 비트겟 실전 자동 주문 활성화", value=False)
-    order_usdt_size = st.sidebar.number_input("주문 금액 (USDT)", min_value=10.0, value=50.0, step=10.0)
+    st.title("🔥 Crypto Quant Dashboard V23")
+    st.caption("공격형 돌파 감도 상향 및 거시적 종합분석 탑재 스캐너")
 
     with st.spinner("시세 데이터를 안전하게 불러오는 중입니다..."):
         market, active_exchange = fetch_tickers_safe()
@@ -373,32 +307,31 @@ def main():
 
     st.success(f"✅ 연결 성공: [{active_exchange.upper}] 거래소 데이터 연동 완료 (총 {len(market)}개 심볼 감지)")
     
-    # WFO 분석 수행 및 대시보드 렌더링
-    wfo_params = run_walk_forward_optimization(market)
-    render_market_horizon_dashboard(market, wfo_params)
+    render_market_horizon_dashboard(market)
 
     universe = market.sort_values("quote_volume", ascending=False).head(50)
     symbols = universe["symbol"].tolist()
     market_avg_change = float(market["change_pct"].mean())
 
-    if st.button("🚀 WFO 최적화 기반 Top 50 종목 퀀트 스캔 실행", use_container_width=True):
+    if st.button("🚀 Top 50 종목 하이브리드 퀀트 스캔 실행 (공격형 감도 UP)", use_container_width=True):
         results = []
         progress_bar = st.progress(0)
         total_symbols = len(symbols)
         
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {pool.submit(analyze_symbol_v25, s, active_exchange, market_avg_change, wfo_params): s for s in symbols}
+            futures = {pool.submit(analyze_symbol_v23, s, active_exchange, market_avg_change): s for s in symbols}
             completed = 0
             for f in concurrent.futures.as_completed(futures):
                 completed += 1
                 progress_bar.progress(completed / total_symbols)
                 r = f.result()
-                if r: results.append(r)
+                if r: 
+                    results.append(r)
         
         progress_bar.empty()
-        st.session_state["v25_results"] = results
+        st.session_state["v23_results"] = results
 
-    results = st.session_state.get("v25_results", [])
+    results = st.session_state.get("v23_results", [])
     if results:
         df_res = pd.DataFrame(results)
         agg_df = df_res[df_res["group"] == "AGGRESSIVE"].sort_values("score", ascending=False)
@@ -409,7 +342,7 @@ def main():
         with col1:
             st.markdown("### 🔥 공격형 알파 트레이딩 (돌파)")
             if agg_df.empty:
-                st.info("조건에 부합하는 공격형 종목이 없습니다.")
+                st.info("조건을 완화했음에도 현재 장세에서 부합하는 공격형 종목이 없습니다.")
             else:
                 for _, row in agg_df.iterrows():
                     is_long = row["pos_type"] == "LONG"
@@ -420,7 +353,7 @@ def main():
                     st.markdown(f"""
                     <div class="{card_cls}">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>{badge_html} &nbsp; <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b></div>
+                            <div>{badge_html} &nbsp; <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b> <span style="font-size: 11px; color: #64748b;">({row['exchange']})</span></div>
                             <div style="font-size: 12px; color: #334155;"><b>{fmt_price(row['price'])}</b></div>
                         </div>
                         <div style="margin-top: 6px; font-size: 11px; color: #475569; background: #ffffff; padding: 6px; border-radius: 6px;">
@@ -429,23 +362,6 @@ def main():
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
-
-                    btn_key = f"btn_agg_{row['symbol']}"
-                    if st.button(f"⚡ [{row['symbol']}] 비트겟 즉시 주문 실행", key=btn_key):
-                        if not auto_trade_enabled:
-                            st.warning("사이드바에서 '비트겟 실전 자동 주문 활성화'를 체크해주세요.")
-                        elif not bitget_api_key or not bitget_secret or not bitget_passphrase:
-                            st.error("사이드바에 비트겟 API Key, Secret, Passphrase를 모두 입력해주세요.")
-                        else:
-                            with st.spinner("비트겟 선물 주문 전송 중..."):
-                                success, msg = execute_bitget_futures_order(
-                                    row["symbol"], row["pos_type"], order_usdt_size,
-                                    bitget_api_key, bitget_secret, bitget_passphrase
-                                )
-                                if success:
-                                    st.success(f"✅ {row['symbol']} {row['pos_type']} 진입 성공! ({msg})")
-                                else:
-                                    st.error(f"❌ 주문 실패: {msg}")
 
         with col2:
             st.markdown("### 🛡️ 안정형 스윙 트레이딩 (눌림목)")
@@ -461,7 +377,7 @@ def main():
                     st.markdown(f"""
                     <div class="{card_cls}">
                         <div style="display: flex; justify-content: space-between; align-items: center;">
-                            <div>{badge_html} &nbsp; <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b></div>
+                            <div>{badge_html} &nbsp; <b style="font-size: 14px; color: #0f172a;">{row['symbol']}</b> <span style="font-size: 11px; color: #64748b;">({row['exchange']})</span></div>
                             <div style="font-size: 12px; color: #334155;"><b>{fmt_price(row['price'])}</b></div>
                         </div>
                         <div style="margin-top: 6px; font-size: 11px; color: #475569; background: #ffffff; padding: 6px; border-radius: 6px;">
@@ -470,23 +386,6 @@ def main():
                         </div>
                     </div>
                     """, unsafe_allow_html=True)
-
-                    btn_key = f"btn_stable_{row['symbol']}"
-                    if st.button(f"⚡ [{row['symbol']}] 비트겟 즉시 주문 실행", key=btn_key):
-                        if not auto_trade_enabled:
-                            st.warning("사이드바에서 '비트겟 실전 자동 주문 활성화'를 체크해주세요.")
-                        elif not bitget_api_key or not bitget_secret or not bitget_passphrase:
-                            st.error("사이드바에 비트겟 API Key, Secret, Passphrase를 모두 입력해주세요.")
-                        else:
-                            with st.spinner("비트겟 선물 주문 전송 중..."):
-                                success, msg = execute_bitget_futures_order(
-                                    row["symbol"], row["pos_type"], order_usdt_size,
-                                    bitget_api_key, bitget_secret, bitget_passphrase
-                                )
-                                if success:
-                                    st.success(f"✅ {row['symbol']} {row['pos_type']} 진입 성공! ({msg})")
-                                else:
-                                    st.error(f"❌ 주문 실패: {msg}")
 
 
 if __name__ == "__main__":
