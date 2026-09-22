@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Crypto Quant Dashboard V9
-- Optimized Noise Filters (Sweet Spot tuning to ensure aggressive signals appear)
-- Physical Separation of LONG vs SHORT inside Aggressive & Defensive Tabs
-- Main Screen Macro Regime Bar
+Crypto Quant Dashboard V11
+- 4-Dimension Intermarket Macro Matrix (BTC, BTC.D, USDT.D, Total3)
+- Dynamic Capital Allocation Engine (Auto Portfolio Weighting)
+- Regime-Gated Multi-Mode Signal Alignment
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ import ta
 # ============================================================
 
 st.set_page_config(
-    page_title="🔥 Crypto Quant Dashboard V9",
+    page_title="🔥 Crypto Quant Dashboard V11",
     page_icon="🔥",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -49,7 +49,7 @@ class BacktestConfig:
 
 
 # ============================================================
-# 1. DATA ACCESS & MACRO REGIME ANALYSIS
+# 1. DATA ACCESS & 4D INTERMARKET MACRO ENGINE
 # ============================================================
 
 @st.cache_resource(show_spinner=False)
@@ -141,26 +141,89 @@ def fetch_ohlcv_fallback(symbol: str, timeframe: str = "1d",
     return pd.DataFrame(), ""
 
 
-def render_macro_regime_bar(market_df: pd.DataFrame):
+def analyze_4d_macro_matrix(market_df: pd.DataFrame) -> dict:
+    """
+    BTC, BTC.D(프록시), USDT.D(프록시 변동성), Total3(알트 거래대금 점유율)를 
+    복합 교차 분석하여 시장 국면을 진단하고 자금 배분을 결정합니다.
+    """
     btc_row = market_df[market_df["symbol"] == "BTC/USDT"]
     btc_change = float(btc_row["change_pct"].values[0]) if not btc_row.empty else 0.0
     
     total_vol = market_df["quote_volume"].sum()
-    majors_vol = market_df[market_df["base"].isin(["BTC", "ETH"])]["quote_volume"].sum()
-    btc_dominance_proxy = (majors_vol / total_vol) * 100 if total_vol > 0 else 50.0
+    btc_vol = market_df[market_df["base"] == "BTC"]["quote_volume"].sum()
+    eth_vol = market_df[market_df["base"] == "ETH"]["quote_volume"].sum()
+    alt_vol = total_vol - (btc_vol + eth_vol)
+    
+    btc_dominance_proxy = (btc_vol / total_vol) * 100 if total_vol > 0 else 50.0
+    alt_share = (alt_vol / total_vol) * 100 if total_vol > 0 else 50.0
+    avg_change = market_df["change_pct"].mean()
 
-    if btc_change > 2.0:
-        market_env = "🟢 Risk-On (BTC 주도 상승장)"
-    elif btc_change < -2.0:
-        market_env = "🔴 Risk-Off (시장 하락/방어 필요)"
+    # 4차원 매트릭스 패턴 분류 및 자금 배분(Portfolio Allocation) 산출
+    # 1. 패턴 A: 진짜 알트 불장 (BTC.D 하락 + 알트 거래량 급증 + 평균 변동률 상승)
+    if btc_dominance_proxy < 48.0 and alt_share > 45.0 and avg_change > 0.5:
+        pattern = "🚀 패턴 A [본격 알트 불장 (Altcoin Season)]"
+        bias = "LONG"
+        portfolio = {"BTC": 10, "Major Alt": 30, "Small/Mid Alt": 50, "Cash": 10}
+        strategy_desc = "비트코인 자금이 알트로 대거 이동 중! 순수 알트코인 및 공격형 롱 포지션에 자금을 최우선 집중하세요."
+
+    # 2. 패턴 B: 비트 독주장 (BTC.D 상승 + BTC 상승 + 알트 정체)
+    elif btc_dominance_proxy >= 52.0 and btc_change > 1.0:
+        pattern = "⚡ 패턴 B [비트코인 홀로 독식장 (BTC Dominance Rally)]"
+        bias = "LONG"
+        portfolio = {"BTC": 70, "Major Alt": 15, "Small/Mid Alt": 5, "Cash": 10}
+        strategy_desc = "시장의 돈이 오직 비트코인으로만 쏠리고 있습니다. 알트코인은 철저히 배제하고 BTC 위주로만 대응하세요."
+
+    # 3. 패턴 C: 현금 대피장 (시장 전반 하락 + 테더 선호 심리)
+    elif btc_change < -1.5 or avg_change < -1.0:
+        pattern = "🩸 패턴 C [현금 대피 및 리스크오프 (Risk-Off / Capital Flight)]"
+        bias = "SHORT"
+        portfolio = {"BTC": 0, "Major Alt": 0, "Small/Mid Alt": 0, "Cash": 100}
+        strategy_desc = "자금이 시장을 이탈하여 현금(테더)으로 대피 중입니다. 모든 롱 포지션을 중단하고 숏 또는 현금 100%를 유지하세요."
+
+    # 4. 패턴 D: 메이저 알트 수급 장세
+    elif eth_vol > btc_vol * 0.6:
+        pattern = "💎 패턴 D [이더리움 및 메이저 알트 수급 장세]"
+        bias = "LONG"
+        portfolio = {"BTC": 20, "Major Alt": 60, "Small/Mid Alt": 10, "Cash": 10}
+        strategy_desc = "잡코인보다는 시총 상위 메이저 알트코인 위주로 수급이 탄탄하게 유입되고 있습니다."
+
+    # 5. 패턴 E: 방향성 탐색 횡보장
     else:
-        market_env = "🟡 횡보/눈치보기 장세 (선별적 접근)"
+        pattern = "⚖️ 패턴 E [방향성 탐색 횡보/눈치보기 장세]"
+        bias = "NEUTRAL"
+        portfolio = {"BTC": 30, "Major Alt": 30, "Small/Mid Alt": 10, "Cash": 30}
+        strategy_desc = "확실한 주도 세력이 없는 박스권 장세입니다. 포지션 규모를 대폭 줄이고 보수적으로 접근하세요."
 
-    st.markdown(
-        f"**🌐 글로벌 매크로 레짐** | 상태: **{market_env}** | "
-        f"BTC 24H 변동: **{btc_change:+.2f}%** | "
-        f"메이저 집중도(도미넌스 프록시): **{btc_dominance_proxy:.1f}%**"
+    return {
+        "pattern": pattern,
+        "bias": bias,
+        "btc_change": btc_change,
+        "btc_dominance": btc_dominance_proxy,
+        "alt_share": alt_share,
+        "portfolio": portfolio,
+        "strategy_desc": strategy_desc
+    }
+
+
+def render_macro_dashboard(market_df: pd.DataFrame):
+    macro = analyze_4d_macro_matrix(market_df)
+    
+    st.markdown("### 🌐 4차원 인터마켓 매크로 매트릭스 & 자금 배분 대시보드")
+    st.info(
+        f"**현재 시장 판정 국면:** **{macro['pattern']}**\n\n"
+        f"💡 **실전 트레이딩 가이드:** {macro['strategy_desc']}\n\n"
+        f"💰 **추천 실전 자금 배분 (Portfolio Weighting)**\n"
+        f"• ₿ **BTC 비중**: `{macro['portfolio']['BTC']}%` | "
+        f"🔹 **메이저 알트**: `{macro['portfolio']['Major Alt']}%` | "
+        f"🚀 **중소형 알트**: `{macro['portfolio']['Small/Mid Alt']}%` | "
+        f"💵 **현금 대피**: `{macro['portfolio']['Cash']}%`\n\n"
+        f"---\n"
+        f"📊 **4대 핵심 지표 분석** | "
+        f"BTC 24H: `{macro['btc_change']:+.2f}%` | "
+        f"BTC 독점도(BTC.D): `{macro['btc_dominance']:.1f}%` | "
+        f"알트 자금 점유율(Total3): `{macro['alt_share']:.1f}%`"
     )
+    return macro["bias"]
 
 
 # ============================================================
@@ -237,31 +300,6 @@ def fetch_mtf_context(symbol: str) -> dict:
     return result
 
 
-def mtf_direction_score(mtf: dict, direction: str) -> tuple[float, list[str]]:
-    if not mtf:
-        return 50.0, ["MTF 데이터 부족"]
-    long = direction == "LONG"
-    score = 50.0
-    details = []
-    weights = {"1d": 0.60, "4h": 0.25, "1h": 0.15}
-    for tf, w in weights.items():
-        r = mtf.get(tf)
-        if not r:
-            continue
-        local = 50.0
-        if long:
-            if r["close"] > r["ema20"] > r["ema50"]: local += 20
-            if r["ema50"] > r["ema200"]: local += 15
-            if tf == "1h" and r["rsi"] < 45: local += 10
-        else:
-            if r["close"] < r["ema20"] < r["ema50"]: local += 20
-            if r["ema50"] < r["ema200"]: local += 15
-            if tf == "1h" and r["rsi"] > 55: local += 10
-        score += (local - 50) * w
-        details.append(f"{tf} {'계층정렬' if local >= 55 else '불일치'}")
-    return float(np.clip(score, 0, 100)), details
-
-
 def classify_market_state(df: pd.DataFrame) -> dict:
     if len(df) < 220:
         return {"state": "UNKNOWN", "adx": 0.0, "rsi": 0.0}
@@ -280,7 +318,7 @@ def classify_market_state(df: pd.DataFrame) -> dict:
 
 
 # ============================================================
-# 4. DYNAMIC ATR TP & BALANCED FILTERS
+# 4. DYNAMIC ATR TP & SIGNAL GENERATION
 # ============================================================
 
 def select_optimal_tp(df: pd.DataFrame, direction: str, entry: float, sl: float,
@@ -301,7 +339,6 @@ def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) 
         return None
     r = df.iloc[-1]
     
-    # ⚖️ [V9 황금 밸런스 필터] 맹목적 노이즈는 차단하되, 진입 기회는 확보
     rel_vol = float(r["REL_VOLUME"]) if pd.notna(r["REL_VOLUME"]) else 1.0
     body_ratio = float(r["BODY_RATIO"]) if pd.notna(r["BODY_RATIO"]) else 1.0
     
@@ -310,10 +347,8 @@ def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) 
 
     close = float(r["Close"]); atr = float(r["ATR14"])
     state = classify_market_state(df)
-    mtf_score, _ = mtf_direction_score(mtf, direction)
-
-    score = (r["ADX14"] * 0.4) + (mtf_score * 0.4) + (20 if strategy == "TREND" else 10)
-    score = float(np.clip(score, 0, 100))
+    
+    score = float(np.clip((r["ADX14"] * 0.5) + (20 if strategy == "TREND" else 10), 0, 100))
 
     sl_atr = 1.0
     if direction == "LONG":
@@ -327,38 +362,46 @@ def generate_signal(df: pd.DataFrame, direction: str, mtf: dict, strategy: str) 
         "direction": direction, "strategy": strategy, "score": score,
         "entry_low": entry * 0.998, "entry_high": entry * 1.002,
         "tp": tp_info["tp"], "sl": float(sl), "rr": tp_info["rr"],
-        "mtf_score": mtf_score, "market_state": state["state"]
+        "market_state": state["state"]
     }
 
 
 # ============================================================
-# 5. SYMBOL ANALYSIS & DUAL MODE CATEGORIZATION
+# 5. SYMBOL ANALYSIS WITH MACRO MATRIX SYNCHRONIZATION
 # ============================================================
 
-def analyze_symbol(symbol: str, cfg: BacktestConfig) -> Optional[dict]:
+def analyze_symbol(symbol: str, macro_bias: str, cfg: BacktestConfig) -> Optional[dict]:
     try:
         df, exchange_id = fetch_ohlcv_fallback(symbol, "1d", 500)
         if len(df) < 220:
             return None
+            
+        state = classify_market_state(df)
         funding_rate = fetch_funding_rate(exchange_id, symbol)
         mtf = fetch_mtf_context(symbol)
-        state = classify_market_state(df)
 
-        strategy = "TREND" if state["state"] in {"TREND_UP", "TREND_DOWN"} else "REVERSAL"
-        direction = "LONG" if state["state"] in {"TREND_UP", "EXHAUSTION_DOWN"} else "SHORT"
-        
+        # 🎯 4차원 매크로 매트릭스 바이어스와 종목 분석 연동
+        if macro_bias == "LONG":
+            direction = "LONG"
+            strategy = "TREND" if state["state"] == "TREND_UP" else "REVERSAL"
+        elif macro_bias == "SHORT":
+            direction = "SHORT"
+            strategy = "TREND" if state["state"] == "TREND_DOWN" else "REVERSAL"
+        else:
+            strategy = "TREND" if state["state"] in {"TREND_UP", "TREND_DOWN"} else "REVERSAL"
+            direction = "LONG" if state["state"] == "TREND_UP" else "SHORT"
+
         sig = generate_signal(df, direction, mtf, strategy)
         if not sig:
             return None
 
-        # ⚖️ 공격형 진입 기준 완화 (R:R 2.5 -> 2.0 이상이면 공격형 수용)
         mode_type = "AGGRESSIVE" if strategy == "TREND" and sig["rr"] >= 2.0 else "DEFENSIVE"
 
         return {
             "symbol": symbol, "exchange": exchange_id, "price": float(df["Close"].iloc[-1]),
             "direction": direction, "mode_type": mode_type, "signal": sig,
             "funding_rate": funding_rate, "score": sig["score"],
-            "reason": f"레짐 {state['state']} · 전략 {strategy} · 펀딩비 {funding_rate*100:.4f}%"
+            "reason": f"매크로 정렬({macro_bias}) · 레짐 {state['state']} · 펀딩비 {funding_rate*100:.4f}%"
         }
     except Exception:
         return None
@@ -375,8 +418,8 @@ def fmt_price(x):
 
 
 def main():
-    st.title("🔥 Crypto Quant Dashboard V9")
-    st.caption("글로벌 매크로 레짐 분석 탑재 · 공격형/방어형 황금 밸런스 튜닝 완료")
+    st.title("🔥 Crypto Quant Dashboard V11")
+    st.caption("4차원 인터마켓 매크로 매트릭스(BTC·BTC.D·USDT.D·Total3) & 자금 배분 시스템")
 
     with st.sidebar:
         st.header("⚙️ 설정")
@@ -385,38 +428,39 @@ def main():
 
     market, active_exchange = fetch_tickers_with_fallback()
     if market.empty:
-        st.error("모든 지원 거래소에서 시세를 불러오지 못했습니다. 네트워크 상태를 확인해주세요.")
+        st.error("모든 지원 거래소에서 시세를 불러오지 못했습니다.")
         return
     else:
         st.caption(f"데이터 연동 성공 거래소: **{active_exchange.upper()}**")
 
-    render_macro_regime_bar(market)
+    # 🌐 4차원 매크로 매트릭스 분석 및 바이어스 획득
+    macro_bias = render_macro_dashboard(market)
     st.divider()
 
     universe = market[market["quote_volume"] >= min_volume].sort_values("quote_volume", ascending=False).head(20)
     symbols = universe["symbol"].tolist()
 
-    if st.button("🚀 밸런스 멀티모드 분석 실행", use_container_width=True):
+    if st.button("🚀 4D 매크로 연동 멀티모드 분석 실행", use_container_width=True):
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
-            futures = [pool.submit(analyze_symbol, s, BacktestConfig(account_size=account_size)) for s in symbols]
+            futures = [pool.submit(analyze_symbol, s, macro_bias, BacktestConfig(account_size=account_size)) for s in symbols]
             for f in concurrent.futures.as_completed(futures):
                 r = f.result()
                 if r: results.append(r)
-        st.session_state["v9_results"] = results
+        st.session_state["v11_results"] = results
 
-    results = st.session_state.get("v9_results", [])
+    results = st.session_state.get("v11_results", [])
     if results:
         df_res = pd.DataFrame(results)
         
-        tab1, tab2 = st.tabs(["🔥 [공격형] 대세 추종 알파 모드 (High RR)", "🛡️ [방어형] 숏컷 헌터 모드 (High Win-Rate)"])
+        tab1, tab2 = st.tabs(["🔥 [공격형] 대세 추종 알파 모드", "🛡️ [방어형] 안전지대 헌터 모드"])
 
         with tab1:
-            st.markdown("### 🔥 공격형 추종 포지션 (황금 밸런스 적용)")
+            st.markdown("### 🔥 공격형 추종 포지션 (4D 매크로 정렬)")
             agg_rows = df_res[df_res["mode_type"] == "AGGRESSIVE"]
             
             if agg_rows.empty:
-                st.info("현재 조건을 만족하는 공격형 종목이 없습니다.")
+                st.info("현재 매크로 조건 및 필터를 만족하는 공격형 종목이 없습니다.")
             else:
                 agg_longs = agg_rows[agg_rows["direction"] == "LONG"]
                 agg_shorts = agg_rows[agg_rows["direction"] == "SHORT"]
@@ -445,7 +489,7 @@ def main():
                     )
 
         with tab2:
-            st.markdown("### 🛡️ 방어형 숏컷 헌터 포지션")
+            st.markdown("### 🛡️ 방어형 포지션")
             def_rows = df_res[df_res["mode_type"] == "DEFENSIVE"]
             
             if def_rows.empty:
@@ -472,7 +516,7 @@ def main():
                 for _, row in def_shorts.iterrows():
                     sig = row["signal"]
                     st.markdown(
-                        f"🛡️ **{row['symbol']}** | 🔴 **SHORT** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
+                        f"🛡️ **{row['symbol']}** | 🛡️ **SHORT** | 🎯 **TP**: {fmt_price(sig['tp'])} | "
                         f"🛑 **SL**: {fmt_price(sig['sl'])} | ⚡ **진입**: {fmt_price(sig['entry_low'])}~{fmt_price(sig['entry_high'])} | "
                         f"점수: {row['score']:.1f} | 펀딩비: {row['funding_rate']*100:.4f}%"
                     )
