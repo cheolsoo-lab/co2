@@ -7,7 +7,7 @@ Crypto Quant Dashboard V36 (Optimized 1H/30m Hybrid Engine + POC + ATR Profit Ma
 - Bitget Auto Futures Order: Max Leverage + 1% Asset Risk + OCO TP/SL Execution
 """
 
-from __python__ import annotations
+from __future__ import annotations
 
 import concurrent.futures
 from typing import Optional
@@ -163,9 +163,7 @@ def calculate_volume_profile_poc(df_ohlcv: pd.DataFrame, bins: int = 20) -> floa
 def fetch_hybrid_timeframe_data_v36(exchange_id: str, symbol: str) -> Optional[dict]:
     try:
         ex = make_exchange(exchange_id)
-        raw_symbol = symbol if exchange_id != "binance" else f"{symbol.replace('/','')} :USDT" if ":" not in symbol else symbol
-        if exchange_id == "binance" and ":" not in raw_symbol:
-            raw_symbol = f"{symbol.split('/')[0]}/USDT:USDT"
+        raw_symbol = symbol if exchange_id != "binance" else (f"{symbol.replace('/','')}:USDT" if ":" not in symbol else symbol)
 
         # 1. 1일봉 (대세 추세 방패)
         df_1d = pd.DataFrame(ex.fetch_ohlcv(raw_symbol, timeframe="1d", limit=60), columns=["timestamp", "Open", "High", "Low", "Close", "Volume"])
@@ -372,7 +370,6 @@ def analyze_symbol_v36(symbol: str, exchange_id: str, market_avg_change: float, 
 
     group, pos_type = None, None
 
-    # 1H(메이저 흐름) + 30m(정밀 타점) 컨플루언스
     is_30m_long_momentum = float(r_30m["Close"]) > float(r_30m["EMA9"]) and rsi_30m < 75
     is_30m_short_momentum = float(r_30m["Close"]) < float(r_30m["EMA9"]) and rsi_30m > 25
 
